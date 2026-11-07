@@ -2,7 +2,6 @@
 
 coordinator/main.py calls these functions from the endpoints:
     POST /register, POST /join -> registry.register_node(name, ram, port)  -> {"node_id", "credentials"}
-    POST /heartbeat            -> registry.update_heartbeat(node_id, credentials) -> True/false
     GET  /nodes                -> registry.get_all_nodes()
 """
 import time, threading, secrets
