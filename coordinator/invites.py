@@ -3,7 +3,7 @@
 Flow (endpoints in coordinator/main.py):
     1. POST /invite -> invites.create_invite()               -> {"invite_code", "expires_at"}
     2. Helper pastes the code. Its agent can read the master's address with decode(code).
-    3. POST /join   -> invites.validate_and_use_invite(code) -> True/False,
+    3. POST /join   ->  invites.validate_and_use_invite(code) -> True/false,
                        then registry.register_node(...) hands the helper its node_id + credentials.
 Codes are reusable by several helpers until they expire.
 """
