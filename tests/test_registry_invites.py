@@ -1,7 +1,7 @@
 """Quick checks for registry.py and invites.py, and that coordinator/main.py can call them. Run from the project root:
     python tests/test_registry_invites.py
 """
-import os, sys, time, asyncio
+import os, sys, time, asyncio, unittest
 sys.path.insert(0,os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # so `coordinator` imports from the project root
 from coordinator import registry, invites
 
@@ -81,5 +81,18 @@ def test_main_wiring():
     print("main.py wiring: OK")
 
 
+class RegistryInviteIntegrationTests(unittest.TestCase):
+    """Exercise Person 3's real registry, invitation, and coordinator wiring."""
+
+    def test_registry_behaviour(self):
+        test_registry()
+
+    def test_invitation_behaviour(self):
+        test_invites()
+
+    def test_coordinator_wiring(self):
+        test_main_wiring()
+
+
 if __name__=="__main__":
-    test_registry(); test_invites(); test_main_wiring(); print("all tests passed")
+    unittest.main(verbosity=2)
