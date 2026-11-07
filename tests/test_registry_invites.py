@@ -2,6 +2,8 @@
     python tests/test_registry_invites.py
 """
 import os, sys, time, asyncio, unittest
+# Set dummy admin token for wiring tests
+os.environ["LOWLLAMA_ADMIN_TOKEN"] = "test-admin-token"
 sys.path.insert(0,os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # so `coordinator` imports from the project root
 from coordinator import registry, invites
 
@@ -61,22 +63,38 @@ def test_invites():
 
 def test_main_wiring():
     """Call main.py's endpoint functions directly with the REAL registry/invites (no mocks, no HTTP)."""
-    from fastapi import HTTPException
+    from fastapi import HTTPException, Request
     from coordinator import main
     registry.clear(); invites.clear()
-    reg=asyncio.run(main.register(main.RegistrationRequest(node_name="Helper 1",ram_gb=16,rpc_port=50052)))
+    
+    # Required for /invite
+    os.environ["LOWLLAMA_MASTER_IP"] = "100.64.0.1"
+    
+    # Mock request for address
+    mock_req = type("MockRequest", (), {"client": type("MockClient", (), {"host": "127.0.0.1"})()})()
+
+    # Now requires admin_token and req
+    reg=asyncio.run(main.register(main.RegistrationRequest(
+        node_name="Helper 1", ram_gb=16, rpc_port=50052, admin_token="test-admin-token"
+    ), req=mock_req))
     main.RegistrationResponse(**reg)   # raises if the shape doesn't match main.py's response model
     assert asyncio.run(main.heartbeat(main.HeartbeatRequest(node_id=reg["node_id"],credentials=reg["credentials"])))=={"status":"ok"}
     try: asyncio.run(main.heartbeat(main.HeartbeatRequest(node_id=reg["node_id"],credentials="wrong"))); assert False
     except HTTPException as e: assert e.status_code==401
     nodes=asyncio.run(main.get_nodes())
     assert [main.NodeInfo(**n).node_name for n in nodes]==["Helper 1"]
-    inv=asyncio.run(main.create_invite(main.InviteCreateRequest(admin_token="secret-admin-token")))
+    # Update admin token from old "secret-admin-token"
+    inv=asyncio.run(main.create_invite(main.InviteCreateRequest(admin_token="test-admin-token")))
     main.InviteCreateResponse(**inv)
-    joined=asyncio.run(main.join(main.JoinRequest(invite_code=inv["invite_code"],node_name="Helper 2",ram_gb=8,rpc_port=50052)))
+    # Now requires client_id and req
+    joined=asyncio.run(main.join(main.JoinRequest(
+        invite_code=inv["invite_code"], node_name="Helper 2", ram_gb=8, rpc_port=50052, client_id="client-2"
+    ), req=mock_req))
     main.RegistrationResponse(**joined)
     assert len(registry.get_all_nodes())==2
-    try: asyncio.run(main.join(main.JoinRequest(invite_code="garbage!!",node_name="X",ram_gb=8,rpc_port=50052))); assert False
+    try: asyncio.run(main.join(main.JoinRequest(
+        invite_code="garbage!!", node_name="X", ram_gb=8, rpc_port=50052, client_id="client-3"
+    ), req=mock_req)); assert False
     except HTTPException as e: assert e.status_code==400
     print("main.py wiring: OK")
 

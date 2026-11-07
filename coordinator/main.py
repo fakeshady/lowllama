@@ -10,9 +10,9 @@ app = FastAPI(title="LowLlama Coordinator")
 # --- Schemas ---
 
 class RegistrationRequest(BaseModel):
-    node_name: str = Field(..., min_length=1, max_length=64, example="MyLaptop")
-    ram_gb: float = Field(..., gt=0, example=16.0)
-    rpc_port: int = Field(..., ge=1, le=65535, example=50051)
+    node_name: str = Field(..., min_length=1, max_length=64, json_schema_extra={"examples": ["MyLaptop"]})
+    ram_gb: float = Field(..., gt=0, json_schema_extra={"examples": [16.0]})
+    rpc_port: int = Field(..., ge=1, le=65535, json_schema_extra={"examples": [50051]})
     admin_token: str
 
 class RegistrationResponse(BaseModel):
@@ -24,6 +24,10 @@ class HeartbeatRequest(BaseModel):
     credentials: str
     free_ram_gb: Optional[float] = Field(None, ge=0)
     rpc_ready: Optional[bool] = None
+
+class ReconnectRequest(BaseModel):
+    node_id: str
+    credentials: str
 
 class HeartbeatResponse(BaseModel):
     status: str
@@ -76,8 +80,8 @@ async def health():
 @app.post("/register", response_model=RegistrationResponse)
 async def register(request: RegistrationRequest, req: Request):
     verify_admin(request.admin_token)
+    from coordinator import registry
     try:
-        from coordinator import registry
         result = registry.register_node(
             name=request.node_name,
             ram=request.ram_gb,
@@ -85,8 +89,6 @@ async def register(request: RegistrationRequest, req: Request):
             address=req.client.host if req.client else None
         )
         return result
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Registry module unavailable")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -94,8 +96,8 @@ async def register(request: RegistrationRequest, req: Request):
 
 @app.post("/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(request: HeartbeatRequest):
+    from coordinator import registry
     try:
-        from coordinator import registry
         success = registry.update_heartbeat(
             node_id=request.node_id,
             credentials=request.credentials,
@@ -105,58 +107,96 @@ async def heartbeat(request: HeartbeatRequest):
         if not success:
             raise HTTPException(status_code=401, detail="Invalid node ID or credentials")
         return {"status": "ok"}
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Registry module unavailable")
+    except AttributeError:
+        # Fallback if registry doesn't have update_heartbeat (should not happen if imported)
+        raise HTTPException(status_code=503, detail="Registry function unavailable")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if e.__class__.__name__ == "InvalidNodeData":
+            raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error during heartbeat")
 
 @app.get("/nodes", response_model=List[NodeInfo])
 async def get_nodes():
-    try:
-        from coordinator import registry
-        nodes = registry.get_all_nodes()
-        return nodes
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Registry module unavailable")
+    from coordinator import registry
+    nodes = registry.get_all_nodes()
+    return nodes
 
 @app.post("/invite", response_model=InviteCreateResponse)
 async def create_invite(request: InviteCreateRequest):
     verify_admin(request.admin_token)
     
+    if not os.environ.get("LOWLLAMA_MASTER_IP"):
+        raise HTTPException(status_code=503, detail="set LOWLLAMA_MASTER_IP")
+    
+    from coordinator import invites
     try:
-        from coordinator import invites
         invite = invites.create_invite()
         return invite
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Invites module unavailable")
+    except invites.InviteError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error during invite creation")
 
 @app.post("/join", response_model=RegistrationResponse)
 async def join(request: JoinRequest, req: Request):
+    from coordinator import invites
+    from coordinator import registry
+    
     try:
-        from coordinator import invites
-        from coordinator import registry
+        invites.validate(request.invite_code)
+    except invites.InviteError as e:
+        raise HTTPException(status_code=400, detail=str(e))
         
-        # We use validate() to get specific errors if it fails
+    try:
+        # Proposed register_node should support client_id
         try:
-            invites.validate(request.invite_code)
-        except Exception as e:
-            # Re-wrap invite errors into 400
-            raise HTTPException(status_code=400, detail=str(e))
-            
-        result = registry.register_node(
-            name=request.node_name,
-            ram=request.ram_gb,
-            port=request.rpc_port,
-            address=req.client.host if req.client else None
-            # Note: client_id is received but not yet supported by registry.register_node
-        )
+            result = registry.register_node(
+                name=request.node_name,
+                ram=request.ram_gb,
+                port=request.rpc_port,
+                address=req.client.host if req.client else None,
+                client_id=request.client_id
+            )
+        except TypeError:
+            # Fallback for old registry version
+            result = registry.register_node(
+                name=request.node_name,
+                ram=request.ram_gb,
+                port=request.rpc_port,
+                address=req.client.host if req.client else None
+            )
         return result
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Coordinator dependencies unavailable")
     except HTTPException:
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
+    except Exception as e:
+        if e.__class__.__name__ == "NodeConflictError":
+            raise HTTPException(status_code=409, detail=str(e))
         raise HTTPException(status_code=500, detail="Internal server error during join")
 
+@app.post("/reconnect", response_model=HeartbeatResponse)
+async def reconnect(request: ReconnectRequest):
+    from coordinator import registry
+    try:
+        # Proposed reconnect_node should check node_id and credentials
+        success = registry.reconnect_node(
+            node_id=request.node_id,
+            credentials=request.credentials
+        )
+        if not success:
+             raise HTTPException(status_code=401, detail="Invalid node ID or credentials")
+        return {"status": "ok"}
+    except AttributeError:
+        raise HTTPException(status_code=501, detail="Reconnection not supported by registry")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if e.__class__.__name__ == "NodeAuthError":
+            raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error during reconnect")
+
 if __name__ == "__main__":
-    uvicorn.run("coordinator.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("coordinator.main:app", host="127.0.0.1", port=8000, reload=True)
