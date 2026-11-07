@@ -1,3 +1,27 @@
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
+
+# Local runtimes, downloads, model weights, and build products.
+.runtime/
+models/
+build/
+dist/
+vendor/
+*.gguf
+*.gguf.part
+*.exe
+*.dll
+*.zip
+*.log
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+secrets/
+.streamlit/secrets.toml
+*.pem
+*.key
