@@ -7,10 +7,11 @@ Deadline: **November 8, 2026, 11:00 AM Eastern (EST)**.
 
 ## Current status (verified November 7, 2026)
 
-- `coordinator/__init__.py` contains the existing FastAPI app: `/` returns a
-  status message and `/nodes` returns the in-memory node list, initially empty.
-  `coordinator/main.py` is empty. Node registration, inference integration,
-  scheduling, and a Streamlit dashboard remain to be built.
+- `coordinator/main.py` contains the active FastAPI coordinator, including
+  health, registration, heartbeat, node-list, invite, and join routes. The
+  registry and invitations are currently in memory, so coordinator restarts
+  clear them. Inference integration, scheduling, and a Streamlit dashboard
+  remain to be built.
 - The existing `.venv` runs Python 3.12.3, FastAPI 0.162.2, Uvicorn 0.54.0,
   and psutil 7.2.2. Preserve this environment. It uses `uv` and has no `pip`
   module; that does not prevent running the app.
@@ -266,7 +267,7 @@ syncing, run `uv pip install --python .venv/Scripts/python.exe -r requirements.t
 Only on a fresh checkout without `.venv`, first run `uv venv .venv --python 3.12`.
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn coordinator:app --host 127.0.0.1 --port 8000 --reload
+.\.venv\Scripts\python.exe -m uvicorn coordinator.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Open http://127.0.0.1:8000/docs. Running `coordinator/__init__.py` directly
