@@ -1,4 +1,4 @@
-"""Node registry: stores every laptop that joined and works out online/offline.
+"""Node registry: stores every laptop that joined and works out Online/offline.
 
 coordinator/main.py calls these functions from the endpoints:
     POST /register, POST /join -> registry.register_node(name, ram, port)  -> {"node_id", "credentials"}
