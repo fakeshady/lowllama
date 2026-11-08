@@ -140,8 +140,8 @@ def get_candidate_workers(selected_node_ids=None, min_free_ram_gb=None, allow_lo
 def get_candidates(node_ids=None):
     """The name coordinator/main.py's POST /start calls: same as get_candidate_workers(selected_node_ids=node_ids).
 
-    Returns a CandidateSelection (.candidates, .rejected, .rpc_endpoints(), .as_dict()). An empty .candidates
-    means nobody is usable; /start should refuse rather than launch, and can show .rejected reasons.
+    Returns a CandidateSelection (.candidates, .rejected, .rpc_endpoints(), .as_dict()). /start requires a
+    non-empty node_ids list and refuses (400) when .candidates is empty; .rejected says why each node was left out.
     """
     return get_candidate_workers(selected_node_ids=node_ids)
 

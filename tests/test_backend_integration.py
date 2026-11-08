@@ -195,8 +195,8 @@ def _has_route(path):
 class StartHandoffTests(unittest.TestCase):
     """POST /start -> workers.get_candidates -> launcher.start(model_id, selection).
 
-    coordinator/launcher.py (Itmam's) doesn't exist yet, so a stand-in module is injected into sys.modules for
-    each test only. This checks the hand-off shape, NOT that any model runs.
+    The launcher's start/status/stop are replaced by stand-ins for each test only (no llama-server is started).
+    This checks the hand-off shape, NOT that any model runs.
     """
     @classmethod
     def setUpClass(cls): cls.http=_Http()
@@ -211,14 +211,24 @@ class StartHandoffTests(unittest.TestCase):
         env=mock.patch.dict(os.environ,ENV); env.start(); self.addCleanup(env.stop)
         self.addCleanup(registry.clear)
         self.calls=[]
-        fake=types.ModuleType("coordinator.launcher")
         def start(model_id, selection):
             self.calls.append((model_id,selection))
             return {"status":"starting","model_id":model_id,"worker_ids":[w.node_id for w in selection.candidates]}
-        fake.start=start
-        fake.status=lambda: {"status":"stopped"}
-        fake.stop=lambda: None
-        mods=mock.patch.dict(sys.modules,{"coordinator.launcher":fake}); mods.start(); self.addCleanup(mods.stop)
+        stand_ins={"start":start,"status":lambda: {"status":"stopped"},"stop":lambda: None}
+        import coordinator
+        if "coordinator.launcher" not in sys.modules:   # leave the import state exactly as we found it
+            def forget_launcher():
+                sys.modules.pop("coordinator.launcher",None)
+                if hasattr(coordinator,"launcher"): delattr(coordinator,"launcher")
+            self.addCleanup(forget_launcher)
+        try:
+            from coordinator import launcher as real_launcher   # Itmam's real module: replace its functions only,
+            for name,fn in stand_ins.items():                   # so this works no matter which test imported it first
+                p=mock.patch.object(real_launcher,name,fn); p.start(); self.addCleanup(p.stop)
+        except ImportError:   # older checkout without launcher.py: inject a whole stand-in module
+            fake=types.ModuleType("coordinator.launcher")
+            for name,fn in stand_ins.items(): setattr(fake,name,fn)
+            mods=mock.patch.dict(sys.modules,{"coordinator.launcher":fake}); mods.start(); self.addCleanup(mods.stop)
         self.model=next(iter(main.ALLOWED_MODELS))
 
     def ready(self, name, address, free=8.0):
@@ -244,17 +254,27 @@ class StartHandoffTests(unittest.TestCase):
         self.assertEqual(selection.rpc_endpoints(),"100.64.0.2:50052")
         self.assertEqual({r.node_id:r.reason for r in selection.rejected},{b:"rpc_not_ready","node-missing":"unknown_node"})
 
-    def test_no_node_ids_means_all_candidates_by_free_ram(self):
+    def test_selection_order_is_kept_even_against_free_ram(self):
         low=self.ready("Low","100.64.0.2",free=2.0)
         high=self.ready("High","100.64.0.3",free=12.0)
-        status,body=self.start({"model_id":self.model,"node_ids":[high,low]})
+        status,body=self.start({"model_id":self.model,"node_ids":[low,high]})   # low first on purpose
         self.assertEqual(status,200,body)
-        self.assertEqual(body["worker_ids"],[high,low])
+        self.assertEqual(body["worker_ids"],[low,high])   # becomes RPC0, RPC1 in this order
+        self.assertEqual(self.calls[0][1].rpc_endpoints(),"100.64.0.2:50052,100.64.0.3:50052")
+
+    def test_start_requires_a_non_empty_selection(self):
+        self.ready("Ready","100.64.0.2")
+        for body in ({"model_id":self.model},{"model_id":self.model,"node_ids":[]}):
+            self.assertEqual(self.start(body)[0],400)
+        self.assertEqual(self.calls,[])
 
     def test_start_refuses_when_nobody_is_usable(self):
-        registry.register_node("NotReady",8,50052,address="100.64.0.3")
-        status,_=self.start({"model_id":self.model,"node_ids":["NotReady"]})
-        self.assertIn(status,(400,409,503))
+        not_ready=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]   # real ID, so the not-ready rule is what's tested
+        stale=self.ready("Stale","100.64.0.4")
+        registry._nodes[stale]["last_seen"]-=registry.OFFLINE_AFTER+1   # offline despite its old rpc_ready claim
+        for ids in ([not_ready],[stale],["node-does-not-exist"],[not_ready,stale]):
+            status,_=self.start({"model_id":self.model,"node_ids":ids})
+            self.assertIn(status,(400,409,503),ids)
         self.assertEqual(self.calls,[])
 
 
