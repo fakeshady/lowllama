@@ -13,13 +13,16 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +46,7 @@ STARTUP_TIMEOUT_SECONDS = 60.0
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
 STOP_TIMEOUT_SECONDS = 5.0
 MAX_DIAGNOSTIC_LINES = 200
+LAUNCH_LOG_DIRECTORY = PROJECT_ROOT / ".runtime" / "logs"
 
 _TAILSCALE_NETWORKS = (
     ipaddress.ip_network("100.64.0.0/10"),
@@ -412,14 +416,49 @@ def _drain_output(process: subprocess.Popen[str]) -> None:
     stream = process.stdout
     if stream is None:
         return
+    log_file = _open_launch_log()
     try:
         for line in stream:
+            if log_file is not None:
+                try:
+                    log_file.write(line)
+                    log_file.flush()
+                except (OSError, ValueError):
+                    try:
+                        log_file.close()
+                    except (OSError, ValueError):
+                        pass
+                    log_file = None
             clean = line.rstrip("\r\n")
             if clean:
                 with _lock:
                     _diagnostics.append(clean[:2000])
     finally:
+        if log_file is not None:
+            try:
+                log_file.close()
+            except (OSError, ValueError):
+                pass
         stream.close()
+
+
+def _open_launch_log() -> TextIO | None:
+    """Open a unique local stdout mirror without affecting inference on failure."""
+
+    try:
+        LAUNCH_LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = LAUNCH_LOG_DIRECTORY / (
+            f"api-launcher-{timestamp}-{uuid.uuid4().hex[:8]}.log"
+        )
+        log_file = path.open("x", encoding="utf-8", buffering=1)
+    except OSError:
+        return None
+    try:
+        print(f"LowLlama launcher log: {path}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+    return log_file
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
