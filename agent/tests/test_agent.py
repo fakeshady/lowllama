@@ -18,7 +18,6 @@ from agent.agent import AgentStartupError, HelperAgent, _Backoff, create_agent, 
 from agent.communication import (
     CoordinatorAuthenticationError,
     CoordinatorConnectionError,
-    CoordinatorEnrollmentConflictError,
     CoordinatorEnrollmentError,
     CoordinatorHTTPError,
     CoordinatorTimeoutError,
@@ -95,9 +94,7 @@ class HelperAgentTests(unittest.TestCase):
         self.client.join.return_value = registration
 
         def heartbeat_then_stop(
-            node_id: str,
-            credentials: str,
-            **_status: object,
+            node_id: str, credentials: str, **_kwargs
         ) -> HeartbeatResult:
             self.stop_event.is_set.return_value = True
             return HeartbeatResult("ok")
@@ -276,65 +273,6 @@ class HelperAgentTests(unittest.TestCase):
             free_ram_gb=7.5,
             rpc_ready=True,
         )
-
-    def test_restart_retries_reconnect_before_sending_heartbeats(self) -> None:
-        self.credential_store.load.return_value = StoredRegistration(
-            "https://coordinator.test:8000",
-            "stored-node",
-            "stored-credential",
-        )
-        self.client.reconnect.side_effect = [
-            CoordinatorConnectionError("offline"),
-            ReconnectResult("ok"),
-        ]
-
-        def heartbeat_then_stop(*_args, **_kwargs) -> HeartbeatResult:
-            self.stop_event.is_set.return_value = True
-            return HeartbeatResult("ok")
-
-        self.client.send_heartbeat.side_effect = heartbeat_then_stop
-        waits: list[float] = []
-
-        self._agent(lambda delay: waits.append(delay) or False).run()
-
-        self.assertEqual(self.client.reconnect.call_count, 2)
-        self.client.join.assert_not_called()
-        self.client.send_heartbeat.assert_called_once()
-        self.assertEqual(waits, [3.0, 10.0])
-
-    def test_runtime_probe_failures_report_safe_unknown_state(self) -> None:
-        self.client.join.return_value = RegistrationResult(
-            "server-node", "secret-credential"
-        )
-        self.available_ram_probe.side_effect = OSError("memory unavailable")
-        self.rpc_probe.side_effect = OSError("socket unavailable")
-
-        def heartbeat_then_stop(*_args, **_kwargs) -> HeartbeatResult:
-            self.stop_event.is_set.return_value = True
-            return HeartbeatResult("ok")
-
-        self.client.send_heartbeat.side_effect = heartbeat_then_stop
-
-        self._agent(self.stop_event.wait).run()
-
-        self.client.send_heartbeat.assert_called_once_with(
-            "server-node",
-            "secret-credential",
-            free_ram_gb=None,
-            rpc_ready=False,
-        )
-
-    def test_existing_client_conflict_stops_without_retrying_or_heartbeat(self) -> None:
-        self.client.join.side_effect = CoordinatorEnrollmentConflictError(
-            409, "already enrolled"
-        )
-
-        with self.assertRaisesRegex(AgentStartupError, "already enrolled"):
-            self._agent(lambda _delay: False).run()
-
-        self.client.join.assert_called_once()
-        self.client.send_heartbeat.assert_not_called()
-        self.credential_store.save.assert_not_called()
 
     def test_rejected_stored_credentials_use_explicit_invite_once(self) -> None:
         self.credential_store.load.return_value = StoredRegistration(

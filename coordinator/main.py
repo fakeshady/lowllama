@@ -2,6 +2,7 @@ import os
 import secrets
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -57,7 +58,33 @@ class JoinRequest(BaseModel):
     rpc_port: int = Field(..., ge=1, le=65535)
     client_id: str = Field(..., min_length=1)
 
+class ModelStartRequest(BaseModel):
+    model_id: str
+    node_ids: Optional[List[str]] = None
+
+class ModelStatusResponse(BaseModel):
+    status: str
+    model_id: Optional[str] = None
+    worker_ids: Optional[List[str]] = None
+    error: Optional[str] = None
+
+class ModelStopResponse(BaseModel):
+    status: str
+
+class ChatRequest(BaseModel):
+    messages: List[dict]
+    max_tokens: Optional[int] = Field(512, gt=0, le=4096)
+    temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
+    stream: Optional[bool] = False
+
 # --- Helpers ---
+
+security = HTTPBearer()
+
+ALLOWED_MODELS = {
+    "llama-3-8b": "models/llama-3-8b-instruct.Q4_K_M.gguf",
+    "phi-3-mini": "models/phi-3-mini-4k-instruct.Q4_K_M.gguf"
+}
 
 def verify_admin(token: str):
     admin_secret = os.environ.get("LOWLLAMA_ADMIN_TOKEN")
@@ -66,6 +93,10 @@ def verify_admin(token: str):
         raise HTTPException(status_code=403, detail="Admin access not configured")
     if not secrets.compare_digest(token.encode(), admin_secret.encode()):
         raise HTTPException(status_code=403, detail="Unauthorized")
+
+def get_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    verify_admin(credentials.credentials)
+    return credentials.credentials
 
 # --- API Endpoints ---
 
@@ -118,7 +149,7 @@ async def heartbeat(request: HeartbeatRequest):
         raise HTTPException(status_code=500, detail="Internal server error during heartbeat")
 
 @app.get("/nodes", response_model=List[NodeInfo])
-async def get_nodes():
+async def get_nodes(_admin_token: str = Depends(get_admin)):
     from coordinator import registry
     nodes = registry.get_all_nodes()
     return nodes
@@ -197,6 +228,80 @@ async def reconnect(request: ReconnectRequest):
         if e.__class__.__name__ == "NodeAuthError":
             raise HTTPException(status_code=401, detail=str(e))
         raise HTTPException(status_code=500, detail="Internal server error during reconnect")
+
+@app.post("/start", response_model=ModelStatusResponse)
+async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admin)):
+    if request.model_id not in ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail=f"Model {request.model_id} not in allowlist")
+
+    try:
+        from coordinator import workers
+        from coordinator import launcher
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Model control modules not yet implemented")
+
+    # 1. Get candidate nodes for distributed inference
+    try:
+        candidates = workers.get_candidates(request.node_ids)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error selecting workers: {str(e)}")
+
+    # 2. Call launcher to start the model
+    try:
+        result = launcher.start(request.model_id, candidates)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
+
+@app.get("/status", response_model=ModelStatusResponse)
+async def get_model_status():
+    try:
+        from coordinator import launcher
+        return launcher.status()
+    except ImportError:
+        # If not implemented, return stopped
+        return {"status": "stopped", "error": "Launcher module missing"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.post("/stop", response_model=ModelStopResponse)
+async def stop_model(_admin: str = Depends(get_admin)):
+    try:
+        from coordinator import launcher
+        launcher.stop()
+        return {"status": "stopped"}
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Launcher module missing")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        from coordinator import launcher
+        state = launcher.status()
+        if state.get("status") != "ready":
+            raise HTTPException(status_code=503, detail="Model not ready")
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Launcher module missing")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="Model status unavailable")
+
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                json=request.model_dump(),
+                timeout=120.0
+            )
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+            return response.json()
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Inference server unreachable")
 
 if __name__ == "__main__":
     uvicorn.run("coordinator.main:app", host="127.0.0.1", port=8000, reload=True)
