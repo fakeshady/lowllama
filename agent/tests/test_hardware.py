@@ -6,7 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 # Allow this file to be run directly as well as through unittest discovery.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -110,6 +110,10 @@ class GetHardwareInfoTests(unittest.TestCase):
         self.assertEqual(result["cpu_core_count"], 20)
         self.assertIsNone(result["total_ram_gb"])
         self.assertIsNone(result["available_ram_gb"])
+        self.assertEqual(
+            cpu_count.call_args_list,
+            [call(logical=False), call(logical=True)],
+        )
 
     @patch("agent.hardware.psutil.virtual_memory")
     def test_available_ram_probe_is_dynamic_and_safe(self, virtual_memory) -> None:
@@ -118,10 +122,6 @@ class GetHardwareInfoTests(unittest.TestCase):
 
         virtual_memory.side_effect = OSError("unavailable")
         self.assertIsNone(get_available_ram_gb())
-        self.assertEqual(
-            cpu_count.call_args_list,
-            [unittest.mock.call(logical=False), unittest.mock.call(logical=True)],
-        )
 
 
 if __name__ == "__main__":

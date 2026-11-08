@@ -141,6 +141,20 @@ class CoordinatorClientTests(unittest.TestCase):
             {"node_id": "node-123", "credentials": "cred-secret"},
         )
 
+    def test_reconnect_authentication_failure_is_specific(self) -> None:
+        self.opener.open.side_effect = HTTPError(
+            "https://coordinator.test:8000/reconnect",
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b'{"detail":"Invalid node ID or credentials"}'),
+        )
+
+        with self.assertRaises(CoordinatorAuthenticationError):
+            self.client.reconnect("node-123", "cred-secret")
+
+        self.assertNotIn("cred-secret", str(self.logger.method_calls))
+
     def test_authentication_failure_has_specific_exception_and_no_secret_log(self) -> None:
         credentials = "credential-must-not-be-logged"
         self.opener.open.side_effect = HTTPError(
@@ -235,7 +249,9 @@ class CoordinatorClientTests(unittest.TestCase):
         self.opener.open.return_value = _response(200, b"not-json")
 
         with self.assertRaises(InvalidCoordinatorResponseError):
-            self.client.join("invite", "TestLaptop", 16.0, 50051)
+            self.client.join(
+                "invite", "TestLaptop", 16.0, 50051, "client-123"
+            )
 
     def test_missing_or_wrong_response_fields_are_rejected(self) -> None:
         invalid_responses = (

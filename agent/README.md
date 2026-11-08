@@ -64,23 +64,30 @@ Set variables in the PowerShell window that will start the agent.
 | Variable | Default | Purpose and validation |
 | --- | --- | --- |
 | `LOWLLAMA_COORDINATOR_URL` | `http://127.0.0.1:8000` | Coordinator base URL. Remote URLs must use HTTPS or a literal Tailscale IP address. |
-| `LOWLLAMA_CLIENT_ID` | Generated UUID | Optional stable installation identifier. It is distinct from the coordinator-issued node ID and is not authentication. The current server does not accept this field yet. |
-| `LOWLLAMA_NODE_NAME` | Computer hostname | Display name sent to the coordinator; 1-100 characters without control characters. |
+| `LOWLLAMA_CLIENT_ID` | Generated UUID | Optional stable installation identifier sent during enrollment. It is distinct from the coordinator-issued node ID and is not authentication. |
+| `LOWLLAMA_NODE_NAME` | Computer hostname | Display name sent to the coordinator; 1-64 characters without control characters. |
 | `LOWLLAMA_INVITE_CODE` | Unset | Required for first enrollment or deliberate re-enrollment. Kept in memory only and excluded from logs and object representations. |
 | `LOWLLAMA_HEARTBEAT_INTERVAL_SECONDS` | `5` | Delay after a successful heartbeat; allowed range 1-3600 seconds. The default stays below the coordinator's 10-second offline cutoff. |
 | `LOWLLAMA_REQUEST_TIMEOUT_SECONDS` | `10` | Timeout for each coordinator request; allowed range 0.1-300 seconds. |
 | `LOWLLAMA_RECONNECTION_INTERVAL_SECONDS` | `5` | Initial retry delay; allowed range 0.1-3600 seconds. Retry backoff is capped at 60 seconds. |
+| `LOWLLAMA_RPC_HOST` | `127.0.0.1` | Local RPC listener to probe. Set this to the helper's literal Tailscale IP when RPC binds there. |
+| `LOWLLAMA_RPC_PORT` | `50052` | Local llama.cpp RPC listener port; allowed range 1-65535. |
+| `LOWLLAMA_RPC_PROBE_TIMEOUT_SECONDS` | `0.5` | TCP readiness probe timeout; allowed range 0.05-10 seconds. |
 | `LOWLLAMA_STATE_DIR` | Per-user state directory | Holds the local client ID and DPAPI-encrypted server registration. On Windows the default is `%LOCALAPPDATA%\LowLlama\Agent`. |
 
 Example helper configuration:
 
 ```powershell
+$tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+$helperIp = (& $tailscale ip -4 | Select-Object -First 1).Trim()
 $env:LOWLLAMA_COORDINATOR_URL = 'http://100.100.20.30:8000'
 $env:LOWLLAMA_NODE_NAME = 'UBHack Helper 1'
 $env:LOWLLAMA_INVITE_CODE = '<paste-current-invite-here>'
 $env:LOWLLAMA_HEARTBEAT_INTERVAL_SECONDS = '5'
 $env:LOWLLAMA_REQUEST_TIMEOUT_SECONDS = '10'
 $env:LOWLLAMA_RECONNECTION_INTERVAL_SECONDS = '5'
+$env:LOWLLAMA_RPC_HOST = '100.100.20.40'
+$env:LOWLLAMA_RPC_PORT = '50052'
 ```
 
 Replace `100.100.20.30` with the master's real Tailscale IPv4 address. Plain
@@ -89,6 +96,8 @@ because that traffic is protected by the Tailscale tunnel. Ordinary remote or
 private-LAN HTTP addresses are rejected. Use HTTPS for other coordinator hosts.
 
 Embedded URL usernames, passwords, query strings, and fragments are rejected.
+Replace `100.100.20.40` with this helper's own Tailscale IPv4 address. The RPC
+host must match the address passed to `ggml-rpc-server --host`.
 
 ## Start the helper
 
@@ -125,6 +134,7 @@ the coordinator has explicitly rejected previously stored credentials:
 $env:LOWLLAMA_COORDINATOR_URL = 'http://100.100.20.30:8000'
 $env:LOWLLAMA_NODE_NAME = 'UBHack Helper 1'
 $env:LOWLLAMA_INVITE_CODE = '<paste-current-invite-here>'
+$env:LOWLLAMA_RPC_HOST = $helperIp
 .\.venv\Scripts\python.exe -m agent.agent
 ```
 
@@ -140,11 +150,13 @@ Direct execution is also supported:
 .\.venv\Scripts\python.exe .\agent\agent.py
 ```
 
-The agent joins with the invite, configured display name, detected total RAM,
-and RPC port `50052`. It stores the returned identity before starting
-heartbeats. Temporary heartbeat failures use exponential backoff and do not
-discard valid credentials. A restart authenticates the stored identity with a
-heartbeat and does not call `/join` again. Rejected credentials are deleted;
+The agent joins with the invite, stable client installation ID, configured
+display name, detected total RAM, and configured RPC port. It stores the
+returned identity before starting heartbeats. Each heartbeat includes current
+available RAM and the result of a bounded TCP connection probe to the configured
+RPC listener. Temporary failures use exponential backoff and do not discard
+valid credentials. A restart authenticates the stored identity through
+`/reconnect` and does not call `/join` again. Rejected credentials are deleted;
 the agent requires an explicitly supplied invite instead of using `/register`.
 
 ## Verify registration
@@ -166,10 +178,11 @@ $coordinatorUrl = 'http://100.100.20.30:8000'
 Invoke-RestMethod "$coordinatorUrl/nodes" | ConvertTo-Json -Depth 5
 ```
 
-Find the configured node display name and confirm its status is `online`. On the
-master, also verify RPC model allocation and graph-compute logs before claiming
-that the helper contributed inference; registration alone proves only that the
-agent reached the coordinator.
+Find the configured node display name and confirm its status is `online`, its
+`free_ram_gb` is numeric, and `rpc_ready` agrees with whether the local RPC
+listener is reachable. `rpc_ready` proves only that a TCP listener accepted a
+connection. On the master, verify llama.cpp remote allocation and graph-compute
+logs before claiming that the helper contributed inference.
 
 ## Troubleshooting
 
@@ -190,8 +203,8 @@ Connection failures before enrollment retry at the configured reconnection
 interval, then double up to 60 seconds. Enrollment timeouts, malformed success
 responses, and server errors fail closed because the server might have created
 a node even though the helper did not receive its credentials. Check `/nodes`
-before obtaining another invite; blindly retrying can create a duplicate until
-the server adds the agreed idempotent `client_id` reconciliation contract.
+before obtaining another invite. The coordinator rejects a second `/join` from
+the same client installation ID with HTTP 409 instead of creating a duplicate.
 
 ### The coordinator responds with 404
 
@@ -219,6 +232,13 @@ connection failures, invalid responses, and server errors. It logs
 after recovery. A `401` or `403` means the credentials were rejected. The agent
 removes the rejected local registration and exits unless an explicit invite
 was supplied for one controlled re-enrollment attempt.
+
+### The coordinator responds with 409 during enrollment
+
+The persistent client installation ID is already registered, but this helper
+does not have usable credentials for it. Restore the protected agent state, or
+ask the coordinator administrator to remove the old registry entry before
+using a new invite. The client intentionally does not bypass this protection.
 
 ### RPC is unreachable from the master
 
@@ -259,11 +279,13 @@ Each file can also run directly:
 ```powershell
 .\.venv\Scripts\python.exe .\agent\tests\test_hardware.py -v
 .\.venv\Scripts\python.exe .\agent\tests\test_config.py -v
+.\.venv\Scripts\python.exe .\agent\tests\test_credentials.py -v
 .\.venv\Scripts\python.exe .\agent\tests\test_communication.py -v
+.\.venv\Scripts\python.exe .\agent\tests\test_rpc.py -v
 .\.venv\Scripts\python.exe .\agent\tests\test_agent.py -v
 ```
 
-The Phase 1 baseline is 59 passing agent tests.
+The Phase 1 suite currently contains 70 agent tests.
 
 ## Security considerations
 
@@ -277,7 +299,8 @@ The Phase 1 baseline is 59 passing agent tests.
   for enrollment. Never commit it, paste it into logs, or leave it in a shared
   PowerShell profile.
 - The persistent local `client_id` is an installation identifier, not a server
-  node ID or credential. The current server does not consume it yet.
+  node ID or credential. It prevents accidental duplicate enrollment but cannot
+  authenticate or recover a node without its server-issued credential.
 - The agent collects only the requested general system fields. Enrollment
   currently sends the display name (hostname by default), total RAM, and RPC
   port. It does not read user files, passwords, browser data, or documents.
