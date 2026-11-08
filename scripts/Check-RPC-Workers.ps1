@@ -19,7 +19,11 @@
 .EXAMPLE
     .\scripts\Check-RPC-Workers.ps1 -HelperIp 100.101.102.103
 .EXAMPLE
-    .\scripts\Check-RPC-Workers.ps1 -HelperIp 100.101.102.103,100.101.102.104 -Redact
+    .\scripts\Check-RPC-Workers.ps1 -HelperIp 100.101.102.103,100.101.102.104 -ExpectHelpers 2 -Redact
+
+    Exit code 0 and "PREFLIGHT PASS" only when every row passed. -SkipTailscalePing marks that row SKIPPED and
+    says so in the final line; TCP and --list-devices still decide the result. -ExpectHelpers 2 makes the run
+    fail unless exactly two helper addresses were given (gate G4 needs RPC0 AND RPC1).
 #>
 [CmdletBinding()]
 param(
@@ -31,6 +35,8 @@ param(
     [ValidateRange(1, 120)]
     [int]$ProbeTimeoutSeconds = 20,
     [switch]$SkipTailscalePing,
+    [ValidateRange(0, 16)]
+    [int]$ExpectHelpers = 0,                                     # 0 = any number; 2 = must be exactly two helpers
     [switch]$Redact                                              # mask middle octets in printed output
 )
 
@@ -96,6 +102,9 @@ if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
 }
 
 # 2. addresses
+if ($ExpectHelpers -gt 0 -and $HelperIp.Count -ne $ExpectHelpers) {
+    Add-Result 'Helper count' "$($HelperIp.Count) given" 'FAIL' "expected exactly $ExpectHelpers helper address(es)"
+}
 $ownIps = @()
 if (Test-Path -LiteralPath $tailscale) {
     try { $ownIps = @(& $tailscale ip 2>$null | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } catch { $ownIps = @() }
@@ -134,7 +143,7 @@ for ($i = 0; $i -lt $HelperIp.Count; $i++) {
 # 3 + 4. reachability
 foreach ($helper in $helpers) {
     if ($SkipTailscalePing) {
-        Add-Result 'tailscale ping' $helper.Label 'NOT RUN' 'skipped by -SkipTailscalePing'
+        Add-Result 'tailscale ping' $helper.Label 'SKIPPED' 'skipped by -SkipTailscalePing (diagnostic only; TCP and list-devices still decide)'
     } elseif (Test-Path -LiteralPath $tailscale) {
         & $tailscale ping --c 1 --timeout 5s $helper.Ip *> $null
         if ($LASTEXITCODE -eq 0) { Add-Result 'tailscale ping' $helper.Label 'PASS' 'peer answered' }
@@ -172,7 +181,7 @@ if (-not $serverOk -or $reachable.Count -eq 0 -or $reachable.Count -ne $helpers.
             $line = $lines | Where-Object { $_ -match "^\s*$name\s*:" } | Select-Object -First 1
             if (-not $line) {
                 Add-Result 'list-devices' $helper.Label 'FAIL' "$name missing: not llama.cpp RPC or a different llama.cpp build"
-            } elseif ($line -notmatch [regex]::Escape($helper.Endpoint)) {
+            } elseif ($line -notmatch ('(^|[\s\[])' + [regex]::Escape($helper.Endpoint) + '(\s|\(|$)')) {   # whole endpoint only: 100.64.0.2 must not match 100.64.0.22
                 Add-Result 'list-devices' $helper.Label 'FAIL' "$name does not point at this helper"
             } else {
                 $memory = if ($line -match '\(([^)]*)\)') { $Matches[1] } else { 'memory not shown' }
@@ -193,6 +202,8 @@ $saved = Join-Path $logDir ("rpc-preflight-$(Get-Date -Format 'yyyyMMdd-HHmmss')
 $results | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Set-Content -LiteralPath $saved -Encoding UTF8
 $failed = @($results | Where-Object { $_.Result -eq 'FAIL' }).Count
 $notRun = @($results | Where-Object { $_.Result -eq 'NOT RUN' }).Count
-if ($failed -eq 0 -and $notRun -eq 0) { Write-Output "PREFLIGHT PASS (saved to $saved). This is NOT proof of inference." ; exit 0 }
+$skipped = @($results | Where-Object { $_.Result -eq 'SKIPPED' }).Count
+$skipNote = if ($skipped) { " Tailscale ping SKIPPED by the operator for $skipped helper(s)." } else { '' }
+if ($failed -eq 0 -and $notRun -eq 0) { Write-Output "PREFLIGHT PASS (saved to $saved).$skipNote This is NOT proof of inference." ; exit 0 }
 Write-Output "PREFLIGHT FAIL: $failed failed, $notRun not run (saved to $saved)."
 exit 1

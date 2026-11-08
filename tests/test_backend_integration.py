@@ -8,7 +8,7 @@ installed; otherwise a real uvicorn server on 127.0.0.1 with urllib. Both send r
 real app. Each test clears registry/invite state and patches environment variables only for its own duration.
 No real secrets are used.
 """
-import json, os, socket, sys, threading, time, unittest, urllib.error, urllib.request
+import json, os, shutil, socket, subprocess, sys, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 sys.path.insert(0,os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # so `coordinator` imports from the project root
 from coordinator import registry, invites
@@ -394,11 +394,120 @@ class StartWithRealLauncherTests(unittest.TestCase):
         tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         binary=Path(tmp.name)/"llama-server.exe"; model=Path(tmp.name)/"model.gguf"
         binary.write_bytes(b"x"); model.write_bytes(b"x")
-        for p in (mock.patch.object(self.launcher,"_resolve_runtime",lambda model_id: (binary,model)),   # fake files, real everything else
-                  mock.patch.object(self.launcher,"_ensure_server_port_available")):
-            p.start(); self.addCleanup(p.stop)
+        self.log_dir=Path(tmp.name)/"logs"   # launch logs go here, never into the real .runtime/logs evidence folder
+        patches=[mock.patch.object(self.launcher,"_resolve_runtime",lambda model_id: (binary,model)),   # fake files, real everything else
+                 mock.patch.object(self.launcher,"_ensure_server_port_available")]
+        if hasattr(self.launcher,"LAUNCH_LOG_DIRECTORY"): patches.append(mock.patch.object(self.launcher,"LAUNCH_LOG_DIRECTORY",self.log_dir))
+        for p in patches: p.start(); self.addCleanup(p.stop)
         api_models=getattr(main,"ALLOWED_MODELS",None) or _launcher_models()
         self.model=DEMO_MODEL_ID if DEMO_MODEL_ID in api_models else next(iter(api_models))
+
+    def fake_engine(self):
+        """Mocks for the outside world only: TCP to helpers, the --list-devices probe, the llama-server child, /health."""
+        import contextlib, io, subprocess
+        child=mock.MagicMock(); child.poll.return_value=None; child.stdout=io.StringIO("")
+        def stop_child(): child.poll.return_value=-15
+        child.terminate.side_effect=stop_child
+        def probe(command, **kwargs):   # each endpoint is probed alone, so it always lists as RPC0
+            return subprocess.CompletedProcess(args=command,returncode=0,stdout=f"Available devices:\n  RPC0: {command[2]} (16000 MiB, 8000 MiB free)",stderr="")
+        stack=contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(self.launcher.socket,"create_connection"))
+        run=stack.enter_context(mock.patch.object(self.launcher.subprocess,"run",side_effect=probe))
+        popen=stack.enter_context(mock.patch.object(self.launcher.subprocess,"Popen",return_value=child))
+        stack.enter_context(mock.patch.object(self.launcher,"_health_is_ready",return_value=True))
+        return stack,child,run,popen
+
+    def wait_for(self, wanted, seconds=2):
+        deadline=time.time()+seconds
+        while self.http.get("/status",ADMIN_HEADER)[1]["status"]!=wanted and time.time()<deadline: time.sleep(0.01)
+        return self.http.get("/status",ADMIN_HEADER)[1]
+
+    def laptop(self, address):
+        """An HTTP client that the coordinator sees as coming from this Tailscale address (one per helper laptop)."""
+        client=TestClient(app,client=(address,50000)); self.addCleanup(client.close)
+        return client
+
+    def enroll(self, laptop, code, name, client_id):
+        r=laptop.post("/join",json={"invite_code":code,"client_id":client_id,"node_name":name,"ram_gb":16,"rpc_port":50052})
+        self.assertEqual(r.status_code,200,r.text)
+        node=r.json()
+        r=laptop.post("/heartbeat",json={**node,"free_ram_gb":6.0,"rpc_ready":True})
+        self.assertEqual(r.status_code,200,r.text)
+        return node
+
+    @unittest.skipIf(TestClient is None,"needs TestClient to give each laptop its own client address")
+    def test_two_laptops_enroll_over_http_and_start_as_rpc0_rpc1(self):
+        code=self.http.post("/invite",{},ADMIN_HEADER)[1]["invite_code"]
+        rodel=self.enroll(self.laptop("100.64.0.2"),code,"Rodel-Laptop","install-rodel")
+        shafin=self.enroll(self.laptop("100.64.0.3"),code,"Shafin-Laptop","install-shafin")
+        listing=self.http.get("/nodes",ADMIN_HEADER)[1]
+        self.assertEqual(sorted((n["node_name"],n["address"],n["status"],n["rpc_ready"]) for n in listing),
+                         [("Rodel-Laptop","100.64.0.2","online",True),("Shafin-Laptop","100.64.0.3","online",True)])
+        self.assertNotEqual(rodel["node_id"],shafin["node_id"])
+        real_log_dir=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),".runtime","logs")
+        real_logs=set(os.listdir(real_log_dir)) if os.path.isdir(real_log_dir) else set()
+        stack,child,run,popen=self.fake_engine()
+        with stack:
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[rodel["node_id"],shafin["node_id"]]},ADMIN_HEADER)
+            self.assertEqual(status,200,body)
+            state=self.wait_for("ready")
+        self.assertEqual((state["status"],state["worker_ids"]),("ready",[rodel["node_id"],shafin["node_id"]]))
+        command=popen.call_args.args[0]
+        self.assertEqual(command[command.index("--rpc")+1],"100.64.0.2:50052,100.64.0.3:50052")   # Rodel = RPC0, Shafin = RPC1
+        self.assertEqual(command[command.index("--device")+1],"CUDA0,RPC0,RPC1")
+        self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)
+        self.assertEqual(self.http.get("/status",ADMIN_HEADER)[1]["status"],"stopped")
+        if hasattr(self.launcher,"LAUNCH_LOG_DIRECTORY"):
+            self.assertEqual(len([f for f in os.listdir(self.log_dir) if f.startswith("api-launcher-")]),1)   # one unique log per start
+            if os.path.isdir(real_log_dir): self.assertEqual(set(os.listdir(real_log_dir))-real_logs,set())   # nothing leaked into real evidence logs
+
+    @unittest.skipIf(TestClient is None,"needs TestClient to give each laptop its own client address")
+    def test_one_of_two_laptops_going_silent_refuses_the_whole_start(self):
+        code=self.http.post("/invite",{},ADMIN_HEADER)[1]["invite_code"]
+        rodel_laptop=self.laptop("100.64.0.2")
+        rodel=self.enroll(rodel_laptop,code,"Rodel-Laptop","install-rodel")
+        shafin=self.enroll(self.laptop("100.64.0.3"),code,"Shafin-Laptop","install-shafin")
+        real_now=registry._now
+        stack,child,run,popen=self.fake_engine()
+        with stack, mock.patch.object(registry,"_now",lambda: real_now()+registry.OFFLINE_AFTER+1):
+            self.assertEqual(rodel_laptop.post("/heartbeat",json=rodel).status_code,200)   # only Rodel keeps beating
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[rodel["node_id"],shafin["node_id"]]},ADMIN_HEADER)
+        self.assertEqual(status,400,body)
+        self.assertIn(shafin["node_id"],json.dumps(body)); self.assertIn("offline",json.dumps(body))
+        run.assert_not_called(); popen.assert_not_called()   # never probed, never started with Rodel alone
+
+    def test_second_start_while_running_is_busy_and_leaves_the_first_alone(self):
+        a=registry.register_node("A",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
+        stack,child,run,popen=self.fake_engine()
+        with stack:
+            self.assertEqual(self.http.post("/start",{"model_id":self.model,"node_ids":[a]},ADMIN_HEADER)[0],200)
+            self.assertEqual(self.wait_for("ready")["status"],"ready")
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[a]},ADMIN_HEADER)
+            self.assertEqual(status,409,body)
+            self.assertEqual(popen.call_count,1)
+            self.assertEqual(self.http.get("/status",ADMIN_HEADER)[1]["status"],"ready")   # the running engine is untouched
+        child.terminate.assert_not_called()
+        self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)
+        child.terminate.assert_called_once()
+
+    def test_unexpected_launcher_error_returns_500_and_nothing_runs(self):
+        a=registry.register_node("A",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
+        stack,child,run,popen=self.fake_engine()
+        with stack, mock.patch.object(self.launcher,"start",side_effect=RuntimeError("boom")):
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[a]},ADMIN_HEADER)
+        self.assertEqual(status,500,body)
+        self.assertNotIn("Traceback",json.dumps(body))
+        popen.assert_not_called()
+        self.assertNotIn(self.http.get("/status",ADMIN_HEADER)[1]["status"],("starting","ready"))
+        self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)   # safe even though nothing started
+
+    def test_stop_is_idempotent_and_chat_needs_a_ready_engine(self):
+        for _ in range(2):
+            self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER),(200,{"status":"stopped"}))
+        msgs={"messages":[{"role":"user","content":"hi"}]}
+        self.assertEqual(self.http.post("/chat",msgs,ADMIN_HEADER)[0],503)   # stopped: refused before contacting llama-server
+        self.assertEqual(self.http.post("/chat",{**msgs,"stream":True},ADMIN_HEADER)[0],400)
+        self.assertIn(self.http.post("/chat",msgs)[0],(401,403))
 
     def test_worker_lost_between_selection_and_probe_fails_without_starting(self):
         nid=registry.register_node("Helper",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
@@ -453,6 +562,128 @@ class StartWithRealLauncherTests(unittest.TestCase):
         self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)
         self.assertEqual(self.http.get("/status",ADMIN_HEADER)[1]["status"],"stopped")
         child.terminate.assert_called_once()   # only its own child was stopped
+
+
+_POWERSHELL=shutil.which("powershell.exe") or shutil.which("pwsh")
+
+
+@unittest.skipUnless(_has_route("/start") and _POWERSHELL and os.name=="nt","needs POST /start and Windows PowerShell")
+class ApiFlowScriptTests(unittest.TestCase):
+    """scripts/Test-Api-Flow.ps1 against the REAL coordinator app on a local uvicorn port.
+
+    Stand-ins: the launcher's start/status/stop (no llama-server runs) and the coordinator's HTTP call to
+    llama-server on 127.0.0.1:8080. Checks the script's cleanup and error paths, NOT inference.
+    """
+    @classmethod
+    def setUpClass(cls):
+        import uvicorn
+        with socket.socket() as s: s.bind(("127.0.0.1",0)); cls.port=s.getsockname()[1]
+        cls.server=uvicorn.Server(uvicorn.Config(app,host="127.0.0.1",port=cls.port,log_level="critical"))
+        cls.thread=threading.Thread(target=cls.server.run,daemon=True); cls.thread.start()
+        deadline=time.time()+10
+        while not cls.server.started:
+            if time.time()>deadline: raise RuntimeError("test uvicorn server did not start")
+            time.sleep(0.02)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.should_exit=True; cls.thread.join(5)
+
+    def setUp(self):
+        import importlib, httpx
+        registry.clear(); invites.clear(); self.addCleanup(registry.clear)
+        env=mock.patch.dict(os.environ,ENV); env.start(); self.addCleanup(env.stop)
+        launcher=importlib.import_module("coordinator.launcher")
+        self.calls={"start":[],"stop":0,"chat":0}
+        self.states=["starting","ready"]   # what /status reports, one entry per poll; the last one repeats
+        self.start_error=None
+        self.chat_status=200
+        def start(model_id, selection):
+            if self.start_error: raise self.start_error
+            self.calls["start"].append((model_id,[w.node_id for w in selection.candidates]))
+            self.running=True
+            return {"status":"starting","model_id":model_id,"worker_ids":[w.node_id for w in selection.candidates]}
+        def status():
+            if not getattr(self,"running",False): return {"status":"stopped"}
+            state=self.states.pop(0) if len(self.states)>1 else self.states[0]
+            return {"status":state,"model_id":DEMO_MODEL_ID,"worker_ids":[],"error":"engine crashed" if state=="error" else None}
+        def stop():
+            self.calls["stop"]+=1; self.running=False
+        for name,fn in {"start":start,"status":status,"stop":stop}.items():
+            p=mock.patch.object(launcher,name,fn); p.start(); self.addCleanup(p.stop)
+        async def fake_llama_post(client, url, json=None, timeout=None, **kw):
+            self.calls["chat"]+=1
+            body={"choices":[{"index":0,"message":{"role":"assistant","content":"Paris."}}]} if self.chat_status==200 else {"error":"x"}
+            return httpx.Response(self.chat_status,json=body)
+        p=mock.patch.object(httpx.AsyncClient,"post",fake_llama_post); p.start(); self.addCleanup(p.stop)
+
+    def helper(self, name, address):
+        return registry.register_node(name,16,50052,address=address,free_ram_gb=6.0,rpc_ready=True)["node_id"]
+
+    def run_flow(self, *args, token=ADMIN):
+        script=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"scripts","Test-Api-Flow.ps1")
+        env={**os.environ,"LOWLLAMA_ADMIN_TOKEN":token}
+        p=subprocess.run([_POWERSHELL,"-NoProfile","-ExecutionPolicy","Bypass","-File",script,"-CoordinatorUrl",f"http://127.0.0.1:{self.port}",
+                          "-ReadyTimeoutSeconds","20",*args],capture_output=True,text=True,timeout=120,env=env)
+        out=p.stdout+p.stderr
+        self.assertNotIn(ADMIN,out)   # the token is never printed
+        return p.returncode,out
+
+    def test_happy_path_two_helpers_in_order_then_stopped(self):
+        rodel=self.helper("Rodel","100.64.0.2"); shafin=self.helper("Shafin","100.64.0.3")
+        code,out=self.run_flow("-NodeIds",f"{rodel},{shafin}","-ExpectHelpers","2")
+        self.assertEqual(code,0,out)
+        self.assertIn("API FLOW PASS",out); self.assertIn("CHAT SENT AT",out); self.assertIn("Paris.",out)
+        self.assertEqual(self.calls["start"],[(DEMO_MODEL_ID,[rodel,shafin])])   # RPC0=Rodel, RPC1=Shafin
+        self.assertEqual(self.calls["stop"],1)
+
+    def test_engine_error_after_start_still_stops_it(self):   # the old script skipped /stop here and leaked the engine
+        a=self.helper("A","100.64.0.2")
+        self.states=["starting","error"]
+        code,out=self.run_flow("-NodeIds",a)
+        self.assertEqual(code,1,out); self.assertIn("engine error",out)
+        self.assertEqual((self.calls["stop"],self.calls["chat"]),(1,0))
+
+    def test_failed_chat_still_stops_and_fails(self):
+        a=self.helper("A","100.64.0.2")
+        self.chat_status=500
+        code,out=self.run_flow("-NodeIds",a)
+        self.assertEqual(code,1,out); self.assertIn("/chat returned",out)
+        self.assertEqual(self.calls["stop"],1)
+
+    def test_busy_engine_is_left_alone(self):
+        from coordinator import launcher
+        a=self.helper("A","100.64.0.2")
+        self.start_error=launcher.LauncherBusyError("already running")
+        code,out=self.run_flow("-NodeIds",a)
+        self.assertEqual(code,1,out); self.assertIn("409",out)
+        self.assertEqual(self.calls["stop"],0)   # never stop an engine this script did not start
+
+    def test_stale_or_unready_ids_never_reach_start(self):
+        a=self.helper("A","100.64.0.2")
+        b=registry.register_node("NotReady",16,50052,address="100.64.0.3")["node_id"]
+        for ids,reason in (([a,"node-from-yesterday"],"not in the current /nodes"),([a,b],"not rpc_ready"),([a,a],"selected twice")):
+            with self.subTest(reason=reason):
+                code,out=self.run_flow("-NodeIds",",".join(ids))
+                self.assertEqual(code,1,out); self.assertIn(reason,out)
+        self.assertEqual((self.calls["start"],self.calls["stop"]),([],0))
+
+    def test_single_auto_selected_node_is_sent_as_a_list(self):
+        a=self.helper("Only","100.64.0.2")
+        code,out=self.run_flow()
+        self.assertEqual(code,0,out)
+        self.assertEqual(self.calls["start"],[(DEMO_MODEL_ID,[a])])   # a lone ID must still be a JSON list for /start
+
+    def test_expect_helpers_refuses_a_one_helper_run(self):
+        a=self.helper("A","100.64.0.2")
+        code,out=self.run_flow("-NodeIds",a,"-ExpectHelpers","2")
+        self.assertEqual(code,1,out); self.assertIn("expected 2",out)
+        self.assertEqual(self.calls["start"],[])
+
+    def test_missing_token_is_not_run(self):
+        code,out=self.run_flow(token="")
+        self.assertEqual(code,1,out); self.assertIn("NOT RUN",out)
+
 
 
 if __name__=="__main__":

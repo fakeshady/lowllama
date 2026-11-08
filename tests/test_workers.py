@@ -169,6 +169,90 @@ class WorkerSelectionTests(unittest.TestCase):
                           "candidate_reported_free_ram_gb":9.5,"candidates_with_unknown_free_ram":1})
         self.assertIn("reported",s["note"])
 
+    def test_nonsense_free_ram_counts_as_unknown_and_never_crashes(self):
+        fake=[snapshot("nan",address="100.64.0.11",free_ram_gb=float("nan")),snapshot("inf",address="100.64.0.12",free_ram_gb=float("inf")),
+              snapshot("neg",address="100.64.0.13",free_ram_gb=-1.0),snapshot("txt",address="100.64.0.14",free_ram_gb="8"),
+              snapshot("bool",address="100.64.0.15",free_ram_gb=True),snapshot("ok",address="100.64.0.16",free_ram_gb=3.0)]
+        with mock.patch.object(registry,"get_all_nodes",return_value=fake):
+            loose=workers.get_candidate_workers()
+            strict=workers.get_candidate_workers(min_free_ram_gb=1)
+        self.assertEqual(self.ids(loose),["ok","bool","inf","nan","neg","txt"])   # the one real number first, then unknowns by node_id
+        self.assertEqual([w.free_ram_gb for w in loose.candidates],[3.0,None,None,None,None,None])   # never passed on as if real
+        self.assertEqual(self.ids(strict),["ok"])
+        self.assertEqual(self.reasons(strict),{k:workers.FREE_RAM_UNKNOWN for k in ("nan","inf","neg","txt","bool")})
+
+    def test_snapshot_claiming_online_with_an_old_heartbeat_is_offline(self):
+        fake=[snapshot("old",last_seen_s=registry.OFFLINE_AFTER+0.5),snapshot("edge",address="100.64.0.11",last_seen_s=float(registry.OFFLINE_AFTER))]
+        with mock.patch.object(registry,"get_all_nodes",return_value=fake):
+            sel=workers.get_candidates(["old","edge"])
+        self.assertEqual((self.ids(sel),self.reasons(sel)),(["edge"],{"old":workers.OFFLINE}))
+
+    def test_two_helper_order_is_exactly_the_selected_order(self):
+        rodel=self.add("Rodel",address="100.64.0.2",free=2.0)
+        shafin=self.add("Shafin",address="100.64.0.3",free=12.0)   # more free RAM must not reorder an explicit selection
+        self.assertEqual(workers.get_candidates([rodel,shafin]).rpc_endpoints(),"100.64.0.2:50052,100.64.0.3:50052")   # RPC0=Rodel, RPC1=Shafin
+        self.assertEqual(workers.get_candidates([shafin,rodel]).rpc_endpoints(),"100.64.0.3:50052,100.64.0.2:50052")
+        for _ in range(5): self.assertEqual(self.ids(workers.get_candidates((rodel,shafin))),[rodel,shafin])   # any sequence type, stable
+
+    def test_selected_duplicate_endpoint_makes_the_selection_incomplete(self):
+        a=self.add("A",address="100.64.0.2")
+        b=self.add("B",address="100.64.0.2")   # e.g. one laptop enrolled twice after a coordinator restart
+        sel=workers.get_candidates([a,b])
+        self.assertEqual(self.ids(sel),[a])
+        self.assertEqual([(r.node_id,r.reason) for r in sel.selected_rejections()],[(b,workers.DUPLICATE_ENDPOINT)])   # /start must refuse
+
+    def test_equivalent_ipv6_spellings_are_the_same_endpoint(self):
+        fake=[snapshot("a",address="fd7a:115c:a1e0::5"),snapshot("b",address="fd7a:115c:a1e0:0:0:0:0:5")]
+        with mock.patch.object(registry,"get_all_nodes",return_value=fake):
+            sel=workers.get_candidates(["a","b"])
+        self.assertEqual(self.reasons(sel),{"b":workers.DUPLICATE_ENDPOINT})
+        self.assertEqual(sel.rpc_endpoints(),"[fd7a:115c:a1e0::5]:50052")
+
+    def test_non_tailscale_ipv6_and_private_lan_are_rejected(self):
+        fake=[snapshot("v6",address="2001:db8::1"),snapshot("lan",address="192.168.1.20"),snapshot("v6loop",address="::1")]
+        with mock.patch.object(registry,"get_all_nodes",return_value=fake):
+            self.assertEqual(self.reasons(workers.get_candidate_workers()),
+                             {"v6":workers.NOT_TAILSCALE,"lan":workers.NOT_TAILSCALE,"v6loop":workers.NOT_TAILSCALE})
+
+    def test_many_repeated_ids_keep_first_positions(self):
+        a=self.add("A",address="100.64.0.2")
+        b=self.add("B",address="100.64.0.3")
+        self.assertEqual(self.ids(workers.get_candidates([b,b,a,b,a])),[b,a])
+        for bad in (b"node",[a,None],[a,"  "]):
+            with self.assertRaises(ValueError): workers.get_candidates(bad)
+
+    def test_helper_that_comes_back_is_eligible_again(self):
+        reg=registry.register_node("Flaky",16,50052,address="100.64.0.2",free_ram_gb=4.0,rpc_ready=True)
+        nid=reg["node_id"]
+        self.clock[0]+=registry.OFFLINE_AFTER+1
+        self.assertEqual(self.reasons(workers.get_candidates([nid])),{nid:workers.OFFLINE})
+        self.assertTrue(registry.update_heartbeat(nid,reg["credentials"],free_ram_gb=3.5,rpc_ready=True))
+        sel=workers.get_candidates([nid])
+        self.assertEqual((self.ids(sel),sel.candidates[0].free_ram_gb),([nid],3.5))
+        self.assertTrue(registry.update_heartbeat(nid,reg["credentials"],rpc_ready=False))   # RPC server stopped on the helper
+        self.assertEqual(self.reasons(workers.get_candidates([nid])),{nid:workers.RPC_NOT_READY})
+
+    def test_selection_is_consistent_while_heartbeats_arrive(self):
+        import threading
+        reg=registry.register_node("Busy",16,50052,address="100.64.0.2",free_ram_gb=4.0,rpc_ready=True)
+        stop=threading.Event(); errors=[]
+        def beat():
+            while not stop.is_set():
+                try: registry.update_heartbeat(reg["node_id"],reg["credentials"],free_ram_gb=4.0,rpc_ready=True)
+                except Exception as exc: errors.append(exc)
+        t=threading.Thread(target=beat); t.start()
+        try:
+            for _ in range(300): self.assertEqual(self.ids(workers.get_candidates([reg["node_id"]])),[reg["node_id"]])
+        finally:
+            stop.set(); t.join()
+        self.assertEqual(errors,[])
+
+    def test_changing_a_returned_dict_does_not_leak_into_later_selections(self):
+        a=self.add("A",address="100.64.0.2")
+        d=workers.get_candidates([a]).as_dict()
+        d["candidates"][0]["address"]="8.8.8.8"; d["rejected"].append({"node_id":"x"})
+        self.assertEqual(workers.get_candidates([a]).rpc_endpoints(),"100.64.0.2:50052")
+
     def test_sample_data_for_the_launcher(self):
         """SAMPLE DATA: a 16 GB ready helper and an 8 GB offline helper (made-up addresses)."""
         ready=self.add("Shafin-16GB",address="100.101.102.103",free=9.5,ram=16)

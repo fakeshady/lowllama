@@ -13,13 +13,18 @@ What it does NOT do (Itmam's launcher must):
       "verified compute participation" are three different things.
 
 Eligibility rules (a node is a candidate only if ALL hold):
-    1. status == "online"                 (heartbeat within registry.OFFLINE_AFTER seconds)
+    1. status == "online"                 (heartbeat within registry.OFFLINE_AFTER seconds; a snapshot that says
+                                           "online" but reports an older last_seen_s is treated as offline)
     2. rpc_ready is True                  (helper reported its RPC listener is up)
     3. address is a Tailscale IP          (loopback only if allow_loopback=True, for same-laptop tests)
     4. rpc_port is a whole number 1..65535
     5. its address:port is not already taken by an earlier candidate
     6. if min_free_ram_gb is given: free_ram_gb is known AND >= min_free_ram_gb
-       (unknown free RAM is never assumed to be enough)
+       (unknown free RAM is never assumed to be enough; NaN, infinite, negative or non-numeric values count as
+       unknown, and a candidate reports them as free_ram_gb=None)
+
+Selection input: selected_node_ids must be a list of non-empty strings. Repeated IDs count once (first position
+kept), so ["a","b","a"] means RPC0=a, RPC1=b. A str, a non-iterable or an empty/non-text ID raises ValueError.
 
 Ordering (deterministic):
     - With selected_node_ids: the order you selected (that order becomes llama.cpp's RPC0, RPC1, ...).
@@ -38,6 +43,7 @@ SAMPLE DATA (made up, for the launcher's input format only; not from real laptop
     "100.101.102.103:50052"
 """
 import ipaddress
+import math
 from dataclasses import dataclass, asdict
 from coordinator import registry
 
@@ -136,7 +142,7 @@ def get_candidate_workers(selected_node_ids=None, min_free_ram_gb=None, allow_lo
         if reason: rejected.append(RejectedWorker(node["node_id"],node["node_name"],reason)); continue
         seen.add(endpoint)
         candidates.append(WorkerEndpoint(node["node_id"],node["node_name"],str(ipaddress.ip_address(node["address"])),node["rpc_port"],
-                                         node["ram_gb"],node["free_ram_gb"],node["rpc_ready"],node["status"],node["last_seen_s"]))
+                                         node["ram_gb"],_reported_free(node),node["rpc_ready"],node["status"],node["last_seen_s"]))
 
     if selected is not None:
         chosen=set(selected)
@@ -176,6 +182,8 @@ def resource_summary():
 
 def _ineligibility(node, min_free, allow_loopback):
     if node.get("status")!="online": return OFFLINE
+    age=node.get("last_seen_s")
+    if _is_number(age) and age>registry.OFFLINE_AFTER: return OFFLINE   # snapshot disagrees with itself: trust the age
     if node.get("rpc_ready") is not True: return RPC_NOT_READY
     address=node.get("address")
     if address is None or address=="": return NO_ADDRESS
@@ -187,10 +195,20 @@ def _ineligibility(node, min_free, allow_loopback):
     port=node.get("rpc_port")
     if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535: return INVALID_PORT
     if min_free is not None:
-        free=node.get("free_ram_gb")
+        free=_reported_free(node)
         if free is None: return FREE_RAM_UNKNOWN
         if free<min_free: return NOT_ENOUGH_FREE_RAM
     return None
+
+
+def _is_number(value):
+    return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value)
+
+
+def _reported_free(node):
+    """The helper's reported free RAM as a usable number, or None when missing or nonsense (NaN, inf, <0, text)."""
+    free=node.get("free_ram_gb")
+    return float(free) if _is_number(free) and free>=0 else None
 
 
 def _endpoint_key(node):
@@ -198,7 +216,7 @@ def _endpoint_key(node):
 
 
 def _free_ram_order(node):
-    free=node.get("free_ram_gb")
+    free=_reported_free(node)
     return (free is None,-(free or 0.0),node["node_id"])   # most free RAM first, unknown last, then by id
 
 

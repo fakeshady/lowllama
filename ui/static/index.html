@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LowLlama Mission Control</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='7' fill='%23fbbf24'/%3E%3Cellipse cx='16' cy='16' rx='14' ry='5' fill='none' stroke='%236ee7ff' stroke-width='2' transform='rotate(-20 16 16)'/%3E%3C/svg%3E">
+</head>
+<body>
+  <canvas id="starfield" aria-hidden="true"></canvas>
+  <div class="nebula" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#welcome">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="7" class="sun"/>
+        <ellipse cx="16" cy="16" rx="14" ry="5" class="ring" transform="rotate(-20 16 16)"/>
+      </svg>
+      <div>
+        <h1>LowLlama</h1>
+        <p class="subtitle">Pool your laptops into one AI</p>
+      </div>
+    </a>
+    <nav class="top-status">
+      <span id="mode-badge" class="badge" hidden>SIMULATION</span>
+      <a class="nav-link" id="nav-setup" href="#welcome" hidden>Setup</a>
+      <a class="nav-link" id="nav-dashboard" href="#dashboard" hidden>Mission Control</a>
+      <span class="pill" id="role-pill" hidden></span>
+      <span class="clock" id="clock">--:--:--</span>
+    </nav>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <section class="view welcome" id="view-welcome" hidden>
+    <div class="hero">
+      <p class="eyebrow">Set up this laptop</p>
+      <h2 class="hero-title">Turn spare laptops into one constellation</h2>
+      <p class="hero-text">One laptop with an NVIDIA GPU is the <strong>master</strong>: it holds the model and answers chats.
+        Every other laptop is a <strong>helper</strong>: it lends CPU and memory over a private Tailscale network.</p>
+      <svg id="hero-orbit" class="hero-orbit" viewBox="0 70 800 320" role="img" aria-label="Helper laptops orbiting the master"></svg>
+    </div>
+    <div class="role-grid">
+      <button class="role-card" type="button" data-role="master">
+        <svg viewBox="0 0 120 120" class="role-art" aria-hidden="true">
+          <circle cx="60" cy="60" r="44" class="art-glow-sun"/>
+          <circle cx="60" cy="60" r="20" class="art-sun"/>
+          <ellipse cx="60" cy="60" rx="52" ry="18" class="art-orbit"/>
+          <circle cx="110" cy="62" r="6" class="art-planet"/>
+          <circle cx="16" cy="54" r="4" class="art-planet"/>
+        </svg>
+        <span class="role-name">Master</span>
+        <span class="role-tag">Host the constellation</span>
+        <span class="role-desc">This laptop has the NVIDIA GPU. It downloads the model, runs the coordinator and shares an invite code.</span>
+        <span class="role-cta">Set up as master &rarr;</span>
+      </button>
+      <button class="role-card" type="button" data-role="helper">
+        <svg viewBox="0 0 120 120" class="role-art" aria-hidden="true">
+          <circle cx="60" cy="60" r="30" class="art-glow-planet"/>
+          <circle cx="60" cy="60" r="16" class="art-planet big"/>
+          <ellipse cx="60" cy="60" rx="30" ry="9" class="art-ring" transform="rotate(-18 60 60)"/>
+          <path d="M8 104 L38 78" class="art-beam"/>
+        </svg>
+        <span class="role-name">Helper</span>
+        <span class="role-tag">Join a constellation</span>
+        <span class="role-desc">Lend this laptop's CPU and RAM. Paste the invite code from the master and press Join.</span>
+        <span class="role-cta">Set up as helper &rarr;</span>
+      </button>
+    </div>
+  </section>
+
+  <section class="view setup" id="view-master" hidden>
+    <div class="setup-head">
+      <p class="eyebrow">Master setup</p>
+      <h2 class="hero-title small">Launch your constellation</h2>
+      <p class="hero-text">Each step checks itself. Green means done.</p>
+    </div>
+    <ol class="steps">
+      <li class="step" id="m-step-ts">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Connect to the team's Tailscale network</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">Open <strong>Tailscale</strong> from the Start menu, sign in with your own account and pick the team network.
+            New to it? Install from <a href="https://tailscale.com/download/windows" target="_blank" rel="noopener">tailscale.com/download/windows</a>.</p>
+        </div>
+      </li>
+      <li class="step" id="m-step-runtime">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Download the engine and the model</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">Downloads the pinned llama.cpp CUDA build and the Qwen 2.5 0.5B model into <code>.runtime\</code>, checking every SHA256.</p>
+          <div class="row"><button class="btn btn-ghost" type="button" data-install="master">Download</button></div>
+          <pre class="log" data-log="install" hidden></pre>
+        </div>
+      </li>
+      <li class="step" id="m-step-gpu">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Find the NVIDIA GPU</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">The master needs a CUDA GPU (CUDA0). Without one, choose another laptop as the master.</p>
+        </div>
+      </li>
+      <li class="step" id="m-step-coord">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Start the coordinator</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">Runs the LowLlama coordinator on your Tailscale address, port 8000, with a fresh admin key that never leaves this laptop.</p>
+          <div class="row">
+            <button class="btn btn-primary" type="button" id="coord-start">Start coordinator</button>
+            <button class="btn btn-ghost" type="button" id="coord-stop">Stop</button>
+          </div>
+          <pre class="log" data-log="coordinator" hidden></pre>
+        </div>
+      </li>
+      <li class="step" id="m-step-invite">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Invite your helpers</h3>
+          <p class="step-detail" data-detail></p>
+          <div class="invite">
+            <code class="invite-code" data-invite-code>&mdash; &mdash; &mdash;</code>
+            <div class="row">
+              <button class="btn btn-primary" type="button" data-invite-btn>Generate invite code</button>
+              <button class="btn btn-ghost" type="button" data-copy-btn disabled>Copy</button>
+              <span class="muted small" data-invite-expiry></span>
+            </div>
+          </div>
+          <p class="step-help">Send the code to each helper (chat, email). It works for 15 minutes and can be used by several helpers.
+            Restarting the coordinator cancels all codes.</p>
+          <svg id="setup-orbit" class="setup-orbit" viewBox="0 0 800 440" role="img" aria-label="Helpers that joined, orbiting this master"></svg>
+          <ul class="joined" id="joined-list"></ul>
+        </div>
+      </li>
+    </ol>
+    <div class="setup-foot">
+      <button class="btn btn-primary btn-lg" type="button" id="open-dashboard">Open Mission Control &rarr;</button>
+    </div>
+  </section>
+
+  <section class="view setup" id="view-helper" hidden>
+    <div class="setup-head">
+      <p class="eyebrow">Helper setup</p>
+      <h2 class="hero-title small">Join a constellation</h2>
+      <p class="hero-text">You need the invite code from the master. Each step checks itself. Green means done.</p>
+    </div>
+    <ol class="steps">
+      <li class="step" id="h-step-ts">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Connect to the team's Tailscale network</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">Open <strong>Tailscale</strong> from the Start menu, sign in with your own account and accept the master's invitation to the team network.
+            New to it? Install from <a href="https://tailscale.com/download/windows" target="_blank" rel="noopener">tailscale.com/download/windows</a>.</p>
+        </div>
+      </li>
+      <li class="step" id="h-step-runtime">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Download the helper engine</h3>
+          <p class="step-detail" data-detail></p>
+          <p class="step-help">Downloads the pinned llama.cpp CPU build into <code>.runtime\</code>. Helpers never download the model.</p>
+          <div class="row"><button class="btn btn-ghost" type="button" data-install="helper">Download</button></div>
+          <pre class="log" data-log="install" hidden></pre>
+        </div>
+      </li>
+      <li class="step" id="h-step-code">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Paste the invite code</h3>
+          <p class="step-detail" data-detail></p>
+          <textarea id="invite-input" rows="3" spellcheck="false" placeholder="Paste the code the master sent you" aria-label="Invite code"></textarea>
+          <div class="row">
+            <button class="btn btn-ghost" type="button" id="check-code">Check code</button>
+            <span class="small" id="code-result"></span>
+          </div>
+        </div>
+      </li>
+      <li class="step" id="h-step-name">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Name this laptop</h3>
+          <div class="field-row">
+            <label class="field"><span>Name shown to the master</span><input id="node-name" type="text" maxlength="64"></label>
+            <label class="field narrow"><span>CPU threads to lend</span>
+              <select id="threads"><option>2</option><option selected>4</option><option>6</option><option>8</option></select>
+            </label>
+          </div>
+        </div>
+      </li>
+      <li class="step" id="h-step-join">
+        <span class="step-dot"></span>
+        <div class="step-body">
+          <h3>Join</h3>
+          <p class="step-detail" data-detail></p>
+          <div class="row">
+            <button class="btn btn-primary btn-lg" type="button" id="join-btn">Join the constellation</button>
+            <button class="btn btn-ghost" type="button" id="leave-btn">Leave</button>
+          </div>
+          <div class="checks">
+            <div class="check" id="chk-rpc"><i></i><span>RPC server listening on port 50052</span></div>
+            <div class="check" id="chk-agent"><i></i><span>Registered with the master, sending heartbeats</span></div>
+          </div>
+          <details class="fw">
+            <summary>The master can't reach this laptop?</summary>
+            <p class="step-help">Windows Firewall may block port 50052. Open <strong>Start</strong>, type <strong>PowerShell</strong>, right-click it, choose
+              <strong>Run as administrator</strong>, and run this rule. It only lets the master reach the RPC server:</p>
+            <pre class="log" id="fw-cmd"></pre>
+            <button class="btn btn-ghost" type="button" id="fw-copy">Copy command</button>
+          </details>
+          <pre class="log" data-log="agent" hidden></pre>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <main class="layout view" id="view-dashboard" hidden>
+    <section class="panel map-panel" aria-labelledby="map-title">
+      <div class="panel-head">
+        <h2 id="map-title">Constellation</h2>
+        <div class="legend">
+          <span><i class="lg lg-online"></i>online</span>
+          <span><i class="lg lg-rpc"></i>RPC ready</span>
+          <span><i class="lg lg-offline"></i>offline</span>
+          <span><i class="lg lg-selected"></i>selected</span>
+          <span class="pill small-pill" id="link-pill"><span class="dot"></span><span id="link-text">Connecting&hellip;</span></span>
+        </div>
+      </div>
+      <svg id="orbit-map" viewBox="0 0 800 440" role="img" aria-label="Master and helper nodes"></svg>
+      <p class="hint">Click a planet (or tick it in the Fleet list) to add it to the launch. Click order sets RPC0, RPC1, &hellip;</p>
+    </section>
+
+    <aside class="side">
+      <section class="panel" aria-labelledby="launch-title">
+        <div class="panel-head">
+          <h2 id="launch-title">Launch</h2>
+          <span class="status-chip" id="status-chip" data-status="stopped">stopped</span>
+        </div>
+        <label class="field">
+          <span>Model</span>
+          <select id="model-select"></select>
+        </label>
+        <div class="crew">
+          <span class="crew-label">Crew</span>
+          <ol id="crew-list" class="crew-list"><li class="muted">No helpers selected</li></ol>
+        </div>
+        <div class="row">
+          <button id="launch-btn" class="btn btn-primary" type="button">Launch</button>
+          <button id="stop-btn" class="btn btn-ghost" type="button">Stop</button>
+          <span class="timer" id="launch-timer"></span>
+        </div>
+        <p class="status-detail" id="status-detail"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="fleet-title">
+        <div class="panel-head">
+          <h2 id="fleet-title">Fleet <span class="count" id="fleet-count">0</span></h2>
+          <label class="toggle"><input type="checkbox" id="reveal-toggle"> show addresses</label>
+        </div>
+        <ul id="fleet-list" class="fleet"></ul>
+      </section>
+
+      <section class="panel" aria-labelledby="invite-title">
+        <div class="panel-head"><h2 id="invite-title">Invite a helper</h2></div>
+        <div class="invite">
+          <code class="invite-code" data-invite-code>&mdash; &mdash; &mdash;</code>
+          <div class="row">
+            <button class="btn btn-ghost" type="button" data-invite-btn>Generate code</button>
+            <button class="btn btn-ghost" type="button" data-copy-btn disabled>Copy</button>
+          </div>
+          <p class="muted small" data-invite-expiry></p>
+        </div>
+      </section>
+    </aside>
+
+    <section class="panel chat-panel" aria-labelledby="chat-title">
+      <div class="panel-head">
+        <h2 id="chat-title">Transmission console</h2>
+        <button id="clear-btn" class="btn btn-link" type="button">Clear</button>
+      </div>
+      <div id="chat-log" class="chat-log" aria-live="polite">
+        <div class="msg system">Launch the model, then send a message. Answers are computed by the master and the selected helpers.</div>
+      </div>
+      <form id="chat-form" class="chat-form" autocomplete="off">
+        <input id="chat-input" type="text" placeholder="Ask the constellation&hellip;" maxlength="2000" aria-label="Message">
+        <button id="send-btn" class="btn btn-primary" type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
