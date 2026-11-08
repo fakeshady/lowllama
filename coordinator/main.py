@@ -247,8 +247,8 @@ async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admi
             raise HTTPException(status_code=400, detail="No usable workers found in selection")
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error selecting workers: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Error selecting workers")
 
     # 2. Call launcher to start the model (offloaded to threadpool)
     try:
@@ -258,8 +258,8 @@ async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admi
         raise HTTPException(status_code=409, detail=str(e))
     except (launcher.LauncherConfigurationError, launcher.LauncherSelectionError, launcher.RpcEndpointError) as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Launcher error")
 
 @app.get("/status", response_model=ModelStatusResponse)
 async def get_model_status(_admin: str = Depends(get_admin)):
@@ -269,8 +269,8 @@ async def get_model_status(_admin: str = Depends(get_admin)):
         return launcher.status()
     except ImportError:
         return {"status": "stopped", "error": "Launcher module missing"}
-    except Exception as e:
-        return {"status": "error", "error": f"Status check failed: {str(e)}"}
+    except Exception:
+        return {"status": "error", "error": "Status check failed"}
 
 @app.post("/stop", response_model=ModelStopResponse)
 async def stop_model(_admin: str = Depends(get_admin)):
@@ -281,8 +281,8 @@ async def stop_model(_admin: str = Depends(get_admin)):
         return {"status": "stopped"}
     except ImportError:
         raise HTTPException(status_code=501, detail="Launcher module missing")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Launcher error")
 
 @app.post("/chat")
 async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):

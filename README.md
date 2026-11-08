@@ -84,12 +84,12 @@ $env:LOWLLAMA_COORDINATOR_HOST = "100.x.y.z"
 $env:LOWLLAMA_COORDINATOR_PORT = "8000"
 
 # Start the coordinator
-.\.venv\Scripts\python.exe coordinator\main.py
+.\.venv\Scripts\python.exe -m coordinator.main
 ```
 
 For development/localhost:
 ```powershell
-.\.venv\Scripts\python.exe coordinator\main.py
+.\.venv\Scripts\python.exe -m coordinator.main
 ```
 (It defaults to 127.0.0.1:8000 if variables are unset).
 

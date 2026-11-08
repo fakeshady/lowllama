@@ -31,7 +31,7 @@ Helper endpoints (`/join`, `/heartbeat`, `/reconnect`) use either an invite code
 #### `POST /join`
 - **Request:** `{"invite_code", "node_name", "ram_gb", "rpc_port", "client_id"}`
 - **Response:** `{"node_id": "string", "credentials": "secret_string"}`
-- **Errors:** 400 (Invalid invite/data), 409 (Conflict/Already enrolled)
+- **Errors:** 400 (Invalid invite), 409 (Conflict/Already enrolled), 422 (Invalid node data)
 
 #### `POST /heartbeat`
 - **Request:** `{"node_id", "credentials", "free_ram_gb", "rpc_ready"}`
