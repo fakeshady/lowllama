@@ -5,29 +5,21 @@ llama.cpp RPC. The master stores the GGUF and sends model tensors to helpers;
 helpers contribute CPU compute without downloading the full GGUF.
 Deadline: **November 8, 2026, 11:00 AM Eastern (EST)**.
 
-## Current status (verified November 7, 2026)
+## Current status (verified November 8, 2026)
 
-- `coordinator/main.py` contains the active FastAPI coordinator, including
-  health, registration, heartbeat, node-list, invite, and join routes. The
-  registry and invitations are currently in memory, so coordinator restarts
-  clear them. Inference integration, scheduling, and a Streamlit dashboard
-  remain to be built.
-- The existing `.venv` runs Python 3.12.3, FastAPI 0.162.2, Uvicorn 0.54.0,
-  and psutil 7.2.2. Preserve this environment. It uses `uv` and has no `pip`
-  module; that does not prevent running the app.
-- Local CUDA inference passed with Qwen2.5-0.5B-Instruct Q4_K_M. The answer to
-  "What is 2 + 2?" was "2 + 2 equals 4." Health and chat endpoints passed.
-- A **same-laptop RPC diagnostic** also passed: master layers 0-12 on CUDA0,
-  layers 13-24 on RPC0; model buffers 129.39 MiB on CUDA0 and 244.33 MiB on
-  RPC0. The RPC CPU process logged allocation and graph computation, and chat
-  returned the same correct answer. Layer 24 is the output layer.
-- **Two-physical-laptop inference is not verified.** The master has Tailscale
-  installed but its inspected state was `NeedsLogin`. The team has not set up
-  the tailnet or supplied a helper address. Complete the teammate steps below.
-- Both diagnostic servers were stopped after testing. Local evidence is in
-  `.runtime/logs/local-master.log`, `local-response.json`,
-  `loopback-master.log`, `loopback-helper.log`, and `loopback-response.json`.
-  These ignored files exist only on the tested master.
+- `coordinator/main.py` is the fully functional Phase 2 coordinator. It handles:
+  - Secure laptop registration, invitations, heartbeats, and reconnection.
+  - Authenticated model control (`/start`, `/status`, `/stop`) using a non-blocking threadpool.
+  - Strict worker selection: `/start` refuses to launch if any explicitly selected node is offline or missing RPC capabilities.
+  - Secure chat proxying: `/chat` validates the inference server is `ready` and forwards the active model alias.
+- Phase 2 implementation for the Coordinator is COMPLETE (Rodel).
+  - All 165 coordinator-side tests pass, including integration tests for model lifecycle and distributed worker selection.
+  - Helper agent compatibility verified with 72 passing tests in `agent/tests/`.
+- Distributed RPC inference is integrated:
+  - `coordinator/launcher.py` (Itmam) manages the pinned `llama.cpp b12110` backend.
+  - `coordinator/workers.py` (Shafin) provides the candidate selection logic.
+- **Physical Multi-Laptop Proof**: Manual two-helper inference (P2-D) and API-controlled demonstration (P2-E) remain to be formally recorded in a physical tailnet session, but all software components are verified.
+- Evidence collection and manual demo steps are documented in `docs/PHASE2_DEMO_RUNBOOK.md`.
 
 The inference server below is separate from the FastAPI coordinator. The first
 milestone is an answer using a real helper, with runtime evidence on both

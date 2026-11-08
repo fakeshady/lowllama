@@ -260,6 +260,7 @@ class TestCoordinatorAPI(unittest.TestCase):
         workers_mock = MagicMock()
         selection_mock = MagicMock()
         selection_mock.candidates = [MagicMock()]
+        selection_mock.selected_rejections.return_value = ()
         workers_mock.get_candidates.return_value = selection_mock
         launcher_mock = MagicMock()
         launcher_mock.start.return_value = {"status": "starting", "model_id": "llama-3-8b"}
@@ -312,6 +313,7 @@ class TestCoordinatorAPI(unittest.TestCase):
         workers_mock = MagicMock()
         selection_mock = MagicMock()
         selection_mock.candidates = [MagicMock()]
+        selection_mock.selected_rejections.return_value = ()
         workers_mock.get_candidates.return_value = selection_mock
         launcher_mock = MagicMock()
         launcher_mock.start.return_value = {"status": "starting", "model_id": "qwen2.5-7b"}

@@ -280,7 +280,6 @@ class StartHandoffTests(unittest.TestCase):
         self.assertEqual({r.node_id:r.reason for r in selection.rejected},{b:"not_selected"})
         self.assertEqual(selection.selected_rejections(),())
 
-    @unittest.expectedFailure   # RODEL GAP (main.py): /start still launches the survivors; remove this marker once fixed
     def test_partial_selection_is_refused_with_the_rejected_workers_named(self):
         a=self.ready("Ready16","100.64.0.2",free=9.5)
         b=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]
@@ -331,7 +330,6 @@ class StartHandoffTests(unittest.TestCase):
             self.assertIn(status,(400,409,503),ids)
         self.assertEqual(self.calls,[])
 
-    @unittest.expectedFailure   # RODEL BUG (main.py e127f2d): selection.rejected is a tuple, .items() crashes, detail shows the crash text
     def test_refusal_names_each_rejected_worker_and_its_reason(self):
         not_ready=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]
         status,body=self.start({"model_id":self.model,"node_ids":[not_ready,"node-missing"]})

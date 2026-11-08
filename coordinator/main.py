@@ -241,17 +241,15 @@ async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admi
     # 1. Get candidate nodes for distributed inference
     try:
         selection = workers.get_candidates(request.node_ids)
+        selected_rejections = selection.selected_rejections()
+        if selected_rejections:
+            reasons = "; ".join(f"{item.node_id}: {item.reason}" for item in selected_rejections)
+            raise HTTPException(status_code=400, detail=f"Selected workers unavailable: {reasons}")
         if not selection.candidates:
-            # Check if any were rejected
-            if getattr(selection, 'rejected', None):
-                reasons = ", ".join([f"{nid}: {err}" for nid, err in selection.rejected.items()])
-                raise HTTPException(status_code=400, detail=f"No usable workers. Rejected: {reasons}")
             raise HTTPException(status_code=400, detail="No usable workers found in selection")
     except HTTPException:
         raise
     except Exception as e:
-        # Check if it looks like a registry or selection error that should be 400
-        # If it's a generic Exception from workers.get_candidates it might be bad data
         raise HTTPException(status_code=400, detail=f"Error selecting workers: {str(e)}")
 
     # 2. Call launcher to start the model (offloaded to threadpool)
@@ -313,8 +311,9 @@ async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
         async with httpx.AsyncClient() as client:
             # Pinned to 127.0.0.1:8080 as per launcher.SERVER_PORT
             payload = request.model_dump()
-            # Explicitly set model to current active model or a known alias if needed
-            # For now, llama-server usually accepts what it's given or ignores it
+            
+            # Task R-C: Forward the active model alias
+            payload['model'] = state.get('model_id', 'lowllama')
             
             response = await client.post(
                 "http://127.0.0.1:8080/v1/chat/completions",
