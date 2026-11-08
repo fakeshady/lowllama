@@ -21,6 +21,8 @@ from agent.communication import (
     CoordinatorAuthenticationError,
     CoordinatorClient,
     CoordinatorConnectionError,
+    CoordinatorEnrollmentError,
+    CoordinatorEnrollmentConflictError,
     CoordinatorHTTPError,
     CoordinatorTimeoutError,
     InvalidCoordinatorResponseError,
@@ -40,7 +42,7 @@ def _response(status: int, body: object) -> MagicMock:
 
 
 class CoordinatorClientTests(unittest.TestCase):
-    """Verify the approved registration and heartbeat contracts."""
+    """Verify the approved join and heartbeat contracts."""
 
     def setUp(self) -> None:
         self.opener = MagicMock()
@@ -52,34 +54,88 @@ class CoordinatorClientTests(unittest.TestCase):
             logger=self.logger,
         )
 
-    def test_register_sends_contract_payload_and_parses_response(self) -> None:
+    def test_join_sends_contract_payload_and_parses_response(self) -> None:
         self.opener.open.return_value = _response(
             200, {"node_id": "node-123", "credentials": "cred-secret"}
         )
 
-        result = self.client.register("TestLaptop", 16.0, 50051)
+        invite = "invite-must-not-be-logged"
+        result = self.client.join(
+            invite,
+            "TestLaptop",
+            16.0,
+            50051,
+            "client-installation-123",
+        )
 
         self.assertEqual(result.node_id, "node-123")
         self.assertEqual(result.credentials, "cred-secret")
         self.assertNotIn("cred-secret", repr(result))
         request = self.opener.open.call_args.args[0]
-        self.assertEqual(request.full_url, "https://coordinator.test:8000/register")
+        self.assertEqual(request.full_url, "https://coordinator.test:8000/join")
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.get_header("Content-type"), "application/json")
         self.assertEqual(
             json.loads(request.data),
-            {"node_name": "TestLaptop", "ram_gb": 16.0, "rpc_port": 50051},
+            {
+                "invite_code": invite,
+                "node_name": "TestLaptop",
+                "ram_gb": 16.0,
+                "rpc_port": 50051,
+                "client_id": "client-installation-123",
+            },
         )
         self.assertEqual(self.opener.open.call_args.kwargs["timeout"], 2.5)
+        self.assertNotIn(invite, str(self.logger.method_calls))
+
+    def test_health_check_uses_get_and_validates_status(self) -> None:
+        self.opener.open.return_value = _response(200, {"status": "healthy"})
+
+        result = self.client.check_health()
+
+        self.assertEqual(result.status, "healthy")
+        request = self.opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://coordinator.test:8000/health")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIsNone(request.data)
+
+    def test_unhealthy_health_response_is_rejected(self) -> None:
+        self.opener.open.return_value = _response(200, {"status": "starting"})
+
+        with self.assertRaises(InvalidCoordinatorResponseError):
+            self.client.check_health()
 
     def test_heartbeat_sends_credentials_in_required_body(self) -> None:
         self.opener.open.return_value = _response(200, {"status": "ok"})
 
-        result = self.client.send_heartbeat("node-123", "cred-secret")
+        result = self.client.send_heartbeat(
+            "node-123",
+            "cred-secret",
+            free_ram_gb=6.25,
+            rpc_ready=True,
+        )
 
         self.assertEqual(result.status, "ok")
         request = self.opener.open.call_args.args[0]
         self.assertEqual(request.full_url, "https://coordinator.test:8000/heartbeat")
+        self.assertEqual(
+            json.loads(request.data),
+            {
+                "node_id": "node-123",
+                "credentials": "cred-secret",
+                "free_ram_gb": 6.25,
+                "rpc_ready": True,
+            },
+        )
+
+    def test_reconnect_sends_only_stored_identity(self) -> None:
+        self.opener.open.return_value = _response(200, {"status": "ok"})
+
+        result = self.client.reconnect("node-123", "cred-secret")
+
+        self.assertEqual(result.status, "ok")
+        request = self.opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://coordinator.test:8000/reconnect")
         self.assertEqual(
             json.loads(request.data),
             {"node_id": "node-123", "credentials": "cred-secret"},
@@ -114,9 +170,37 @@ class CoordinatorClientTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 403)
 
+    def test_invalid_invite_has_specific_enrollment_error(self) -> None:
+        invite = "rejected-invite-must-not-be-logged"
+        self.opener.open.side_effect = HTTPError(
+            "https://coordinator.test:8000/join",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"detail":"Invalid or expired invite code"}'),
+        )
+
+        with self.assertRaises(CoordinatorEnrollmentError) as raised:
+            self.client.join(invite, "TestLaptop", 16.0, 50051, "client-123")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertNotIn(invite, str(self.logger.method_calls))
+
+    def test_existing_client_id_has_specific_conflict_error(self) -> None:
+        self.opener.open.side_effect = HTTPError(
+            "https://coordinator.test:8000/join",
+            409,
+            "Conflict",
+            hdrs=None,
+            fp=io.BytesIO(b'{"detail":"this helper is already enrolled"}'),
+        )
+
+        with self.assertRaises(CoordinatorEnrollmentConflictError):
+            self.client.join("invite", "TestLaptop", 16.0, 50051, "client-123")
+
     def test_other_unsuccessful_response_preserves_status_and_detail(self) -> None:
         self.opener.open.side_effect = HTTPError(
-            "https://coordinator.test:8000/register",
+            "https://coordinator.test:8000/join",
             501,
             "Not Implemented",
             hdrs=None,
@@ -124,7 +208,7 @@ class CoordinatorClientTests(unittest.TestCase):
         )
 
         with self.assertRaises(CoordinatorHTTPError) as raised:
-            self.client.register("TestLaptop", 16.0, 50051)
+            self.client.join("invite", "TestLaptop", 16.0, 50051, "client-123")
 
         self.assertEqual(raised.exception.status_code, 501)
         self.assertEqual(raised.exception.detail, "Registry module not implemented")
@@ -133,25 +217,25 @@ class CoordinatorClientTests(unittest.TestCase):
         self.opener.open.side_effect = URLError("connection refused")
 
         with self.assertRaises(CoordinatorConnectionError):
-            self.client.register("TestLaptop", 16.0, 50051)
+            self.client.join("invite", "TestLaptop", 16.0, 50051, "client-123")
 
     def test_direct_timeout_has_specific_exception(self) -> None:
         self.opener.open.side_effect = socket.timeout("timed out")
 
         with self.assertRaises(CoordinatorTimeoutError):
-            self.client.register("TestLaptop", 16.0, 50051)
+            self.client.join("invite", "TestLaptop", 16.0, 50051, "client-123")
 
     def test_wrapped_timeout_has_specific_exception(self) -> None:
         self.opener.open.side_effect = URLError(socket.timeout("timed out"))
 
         with self.assertRaises(CoordinatorTimeoutError):
-            self.client.register("TestLaptop", 16.0, 50051)
+            self.client.join("invite", "TestLaptop", 16.0, 50051, "client-123")
 
     def test_invalid_json_response_is_rejected(self) -> None:
         self.opener.open.return_value = _response(200, b"not-json")
 
         with self.assertRaises(InvalidCoordinatorResponseError):
-            self.client.register("TestLaptop", 16.0, 50051)
+            self.client.join("invite", "TestLaptop", 16.0, 50051)
 
     def test_missing_or_wrong_response_fields_are_rejected(self) -> None:
         invalid_responses = (
@@ -164,7 +248,9 @@ class CoordinatorClientTests(unittest.TestCase):
             with self.subTest(response_body=response_body):
                 self.opener.open.return_value = _response(200, response_body)
                 with self.assertRaises(InvalidCoordinatorResponseError):
-                    self.client.register("TestLaptop", 16.0, 50051)
+                    self.client.join(
+                        "invite", "TestLaptop", 16.0, 50051, "client-123"
+                    )
 
     def test_success_log_contains_structure_without_payload(self) -> None:
         self.opener.open.return_value = _response(200, {"status": "ok"})

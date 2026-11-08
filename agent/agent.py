@@ -21,15 +21,22 @@ from agent.communication import (
     CommunicationError,
     CoordinatorAuthenticationError,
     CoordinatorClient,
+    CoordinatorEnrollmentConflictError,
+    CoordinatorEnrollmentError,
     InvalidCoordinatorResponseError,
     RegistrationResult,
 )
 from agent.config import AgentConfig, ConfigurationError, get_config
-from agent.hardware import HardwareInfo, get_hardware_info
+from agent.credentials import (
+    CredentialStore,
+    CredentialStoreError,
+    StoredRegistration,
+)
+from agent.hardware import HardwareInfo, get_available_ram_gb, get_hardware_info
+from agent.rpc import is_rpc_ready
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_RPC_PORT = 50052
 MAX_RETRY_INTERVAL_SECONDS = 60.0
 
 
@@ -64,22 +71,27 @@ class _Backoff:
 
 
 class HelperAgent:
-    """Coordinate registration, heartbeats, retries, and shutdown."""
+    """Coordinate enrollment, heartbeats, retries, and shutdown."""
 
     def __init__(
         self,
         config: AgentConfig,
         hardware_info: HardwareInfo,
         client: CoordinatorClient,
+        credential_store: CredentialStore,
         *,
-        rpc_port: int = DEFAULT_RPC_PORT,
+        available_ram_probe: Callable[[], float | None] = get_available_ram_gb,
+        rpc_probe: Callable[[str, int, float], bool] = is_rpc_ready,
         stop_event: Event | None = None,
         wait: Callable[[float], bool] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
         self._client = client
-        self._rpc_port = rpc_port
+        self._credential_store = credential_store
+        self._available_ram_probe = available_ram_probe
+        self._rpc_probe = rpc_probe
+        self._rpc_port = config.rpc_port
         self._stop_event = stop_event or Event()
         self._wait = wait or self._stop_event.wait
         self._logger = logger or LOGGER
@@ -87,7 +99,7 @@ class HelperAgent:
 
     @staticmethod
     def _required_ram_gb(hardware_info: HardwareInfo) -> float:
-        """Return usable total RAM or fail before sending invalid registration."""
+        """Return usable total RAM or fail before sending invalid enrollment."""
 
         ram_gb = hardware_info.get("total_ram_gb")
         if not isinstance(ram_gb, (int, float)) or isinstance(ram_gb, bool):
@@ -104,9 +116,9 @@ class HelperAgent:
     def run(self) -> None:
         """Run until shutdown is requested.
 
-        A successful registration is retained across temporary heartbeat
-        failures. Re-registration occurs only when no registration exists or
-        the coordinator explicitly rejects its credentials.
+        A successful enrollment is retained across temporary heartbeat
+        failures. Server-issued credentials are loaded before any enrollment
+        attempt and are removed if the coordinator explicitly rejects them.
         """
 
         self._log(
@@ -121,35 +133,139 @@ class HelperAgent:
             self._log(logging.INFO, "helper_agent_stopped")
 
     def _run_until_stopped(self) -> None:
-        """Execute the registration and heartbeat state machine."""
+        """Execute the enrollment and heartbeat state machine."""
 
-        registration: RegistrationResult | None = None
-        registration_backoff = _Backoff(
+        registration = self._load_registration()
+        reconnect_required = registration is not None
+        enrollment_backoff = _Backoff(
             self._config.reconnection_interval_seconds
         )
         heartbeat_backoff = _Backoff(self._config.reconnection_interval_seconds)
         heartbeat_failure_active = False
+        invite_used = False
 
         while not self._stop_event.is_set():
-            if registration is None:
+            if registration is not None and reconnect_required:
                 try:
-                    candidate = self._client.register(
-                        self._config.node_display_name,
-                        self._ram_gb,
-                        self._rpc_port,
+                    reconnect = self._client.reconnect(
+                        registration.node_id,
+                        registration.credentials,
                     )
-                    registration = self._verify_registration(candidate)
-                except CommunicationError as exc:
-                    delay = registration_backoff.next_delay()
+                    self._require_ok_status(reconnect.status, "reconnect")
+                except CoordinatorAuthenticationError as exc:
                     self._log(
                         logging.WARNING,
-                        "registration_failed",
+                        "registration_credentials_rejected",
+                        node_id=registration.node_id,
+                        status_code=exc.status_code,
+                    )
+                    self._clear_rejected_registration()
+                    registration = None
+                    reconnect_required = False
+                    if not self._config.invite_code:
+                        raise AgentStartupError(
+                            "Stored credentials were rejected; obtain a new invite and restart"
+                        ) from exc
+                    delay = enrollment_backoff.next_delay()
+                    self._log(
+                        logging.INFO,
+                        "reenrollment_scheduled",
+                        retry_in_seconds=delay,
+                    )
+                    if self._wait(delay):
+                        break
+                    continue
+                except CommunicationError as exc:
+                    delay = heartbeat_backoff.next_delay()
+                    self._log(
+                        logging.WARNING,
+                        "reconnect_failed",
                         error_type=type(exc).__name__,
                         retry_in_seconds=delay,
                     )
                     if self._wait(delay):
                         break
                     continue
+                reconnect_required = False
+                heartbeat_backoff.reset()
+                self._log(
+                    logging.INFO,
+                    "helper_reconnected",
+                    node_id=registration.node_id,
+                )
+
+            if registration is None:
+                if not self._config.invite_code:
+                    raise AgentStartupError(
+                        "Enrollment is required; set LOWLLAMA_INVITE_CODE and restart"
+                    )
+                try:
+                    self._client.check_health()
+                except CommunicationError as exc:
+                    delay = enrollment_backoff.next_delay()
+                    self._log(
+                        logging.WARNING,
+                        "enrollment_connection_failed",
+                        error_type=type(exc).__name__,
+                        retry_in_seconds=delay,
+                    )
+                    if self._wait(delay):
+                        break
+                    continue
+
+                try:
+                    candidate = self._client.join(
+                        self._config.invite_code,
+                        self._config.node_display_name,
+                        self._ram_gb,
+                        self._rpc_port,
+                        self._config.client_id,
+                    )
+                    registration = self._verify_registration(candidate)
+                    self._credential_store.save(
+                        StoredRegistration(
+                            coordinator_url=self._config.coordinator_url,
+                            node_id=registration.node_id,
+                            credentials=registration.credentials,
+                        )
+                    )
+                    invite_used = True
+                except CoordinatorEnrollmentConflictError as exc:
+                    self._log(
+                        logging.ERROR,
+                        "enrollment_conflict",
+                        status_code=exc.status_code,
+                    )
+                    raise AgentStartupError(
+                        "This client is already enrolled; restore its credentials or ask the administrator to remove it"
+                    ) from exc
+                except CoordinatorEnrollmentError as exc:
+                    self._log(
+                        logging.ERROR,
+                        "enrollment_rejected",
+                        status_code=exc.status_code,
+                    )
+                    raise AgentStartupError(
+                        "Coordinator rejected the invite; obtain a new invite and restart"
+                    ) from exc
+                except CommunicationError as exc:
+                    self._log(
+                        logging.ERROR,
+                        "enrollment_outcome_unknown",
+                        error_type=type(exc).__name__,
+                    )
+                    raise AgentStartupError(
+                        "Enrollment outcome is unknown; check the coordinator before retrying"
+                    ) from exc
+                except CredentialStoreError as exc:
+                    self._log(
+                        logging.ERROR,
+                        "credential_persistence_failed",
+                        error_type=type(exc).__name__,
+                    )
+                    raise AgentStartupError(
+                        "Coordinator credentials could not be stored securely"
+                    ) from exc
 
                 heartbeat_backoff.reset()
                 heartbeat_failure_active = False
@@ -160,25 +276,35 @@ class HelperAgent:
                 )
 
             try:
+                free_ram_gb, rpc_ready = self._runtime_status()
                 heartbeat = self._client.send_heartbeat(
                     registration.node_id,
                     registration.credentials,
+                    free_ram_gb=free_ram_gb,
+                    rpc_ready=rpc_ready,
                 )
-                if not heartbeat.status.strip():
-                    raise InvalidCoordinatorResponseError(
-                        "Coordinator heartbeat status is empty"
-                    )
+                self._require_ok_status(heartbeat.status, "heartbeat")
             except CoordinatorAuthenticationError as exc:
                 self._log(
                     logging.WARNING,
                     "registration_credentials_rejected",
                     node_id=registration.node_id,
                     status_code=exc.status_code,
-                    retry_in_seconds=(delay := registration_backoff.next_delay()),
                 )
+                self._clear_rejected_registration()
                 registration = None
                 heartbeat_backoff.reset()
                 heartbeat_failure_active = False
+                if invite_used or not self._config.invite_code:
+                    raise AgentStartupError(
+                        "Stored credentials were rejected; obtain a new invite and restart"
+                    ) from exc
+                delay = enrollment_backoff.next_delay()
+                self._log(
+                    logging.INFO,
+                    "reenrollment_scheduled",
+                    retry_in_seconds=delay,
+                )
                 if self._wait(delay):
                     break
             except CommunicationError as exc:
@@ -210,7 +336,7 @@ class HelperAgent:
                         node_id=registration.node_id,
                     )
                 heartbeat_failure_active = False
-                registration_backoff.reset()
+                enrollment_backoff.reset()
                 heartbeat_backoff.reset()
                 self._log(
                     logging.DEBUG,
@@ -220,6 +346,63 @@ class HelperAgent:
                 )
                 if self._wait(self._config.heartbeat_interval_seconds):
                     break
+
+    def _load_registration(self) -> RegistrationResult | None:
+        """Load server-issued credentials before considering enrollment."""
+
+        try:
+            stored = self._credential_store.load(self._config.coordinator_url)
+        except CredentialStoreError as exc:
+            raise AgentStartupError(
+                "Stored coordinator credentials could not be loaded securely"
+            ) from exc
+        if stored is None:
+            return None
+        registration = self._verify_registration(
+            RegistrationResult(stored.node_id, stored.credentials)
+        )
+        self._log(
+            logging.INFO,
+            "stored_registration_loaded",
+            node_id=registration.node_id,
+        )
+        return registration
+
+    def _clear_rejected_registration(self) -> None:
+        """Remove credentials that the coordinator explicitly rejected."""
+
+        try:
+            self._credential_store.clear()
+        except CredentialStoreError as exc:
+            raise AgentStartupError(
+                "Rejected coordinator credentials could not be removed"
+            ) from exc
+
+    def _runtime_status(self) -> tuple[float | None, bool]:
+        """Collect current RAM and bounded local RPC reachability safely."""
+
+        try:
+            free_ram_gb = self._available_ram_probe()
+        except Exception:
+            free_ram_gb = None
+        try:
+            rpc_ready = self._rpc_probe(
+                self._config.rpc_host,
+                self._config.rpc_port,
+                self._config.rpc_probe_timeout_seconds,
+            )
+        except Exception:
+            rpc_ready = False
+        return free_ram_gb, bool(rpc_ready)
+
+    @staticmethod
+    def _require_ok_status(status: object, operation: str) -> None:
+        """Require the coordinator's documented successful status value."""
+
+        if not isinstance(status, str) or status.strip().lower() != "ok":
+            raise InvalidCoordinatorResponseError(
+                f"Coordinator {operation} response has an invalid status"
+            )
 
     @staticmethod
     def _verify_registration(result: object) -> RegistrationResult:
@@ -255,10 +438,12 @@ def create_agent(*, stop_event: Event | None = None) -> HelperAgent:
         config.coordinator_url,
         config.request_timeout_seconds,
     )
+    credential_store = CredentialStore(config.state_dir)
     return HelperAgent(
         config,
         hardware_info,
         client,
+        credential_store,
         stop_event=stop_event,
     )
 

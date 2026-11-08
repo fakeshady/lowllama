@@ -1,8 +1,9 @@
 # LowLlama Helper Agent
 
 The helper agent runs on a teammate's Windows laptop. It detects basic hardware,
-registers the laptop with the LowLlama coordinator, and sends regular heartbeats
-so the coordinator can track whether the helper is online.
+enrolls through a coordinator invitation, protects the issued node credentials
+with Windows DPAPI, and sends regular authenticated heartbeats so the
+coordinator can track whether the helper is online.
 
 The Python agent does not run model inference, expose HTTP endpoints, manage the
 coordinator registry, or execute commands received from the coordinator. The
@@ -24,7 +25,7 @@ The helper laptop needs:
 - The pinned llama.cpp CPU runtime for the separate RPC process.
 - PowerShell and `curl.exe`, which are included with current Windows versions.
 
-The master must run the coordinator application that defines `/register` and
+The master must run the coordinator application that defines `/join` and
 `/heartbeat`. Those routes currently live in `coordinator.main:app`.
 
 ## Install Python dependencies
@@ -63,19 +64,20 @@ Set variables in the PowerShell window that will start the agent.
 | Variable | Default | Purpose and validation |
 | --- | --- | --- |
 | `LOWLLAMA_COORDINATOR_URL` | `http://127.0.0.1:8000` | Coordinator base URL. Remote URLs must use HTTPS or a literal Tailscale IP address. |
-| `LOWLLAMA_NODE_ID` | Generated UUID | Optional stable local identifier. If omitted, it is generated once and reused. The current coordinator issues a separate server node ID during registration. |
+| `LOWLLAMA_CLIENT_ID` | Generated UUID | Optional stable installation identifier. It is distinct from the coordinator-issued node ID and is not authentication. The current server does not accept this field yet. |
 | `LOWLLAMA_NODE_NAME` | Computer hostname | Display name sent to the coordinator; 1-100 characters without control characters. |
+| `LOWLLAMA_INVITE_CODE` | Unset | Required for first enrollment or deliberate re-enrollment. Kept in memory only and excluded from logs and object representations. |
 | `LOWLLAMA_HEARTBEAT_INTERVAL_SECONDS` | `5` | Delay after a successful heartbeat; allowed range 1-3600 seconds. The default stays below the coordinator's 10-second offline cutoff. |
 | `LOWLLAMA_REQUEST_TIMEOUT_SECONDS` | `10` | Timeout for each coordinator request; allowed range 0.1-300 seconds. |
 | `LOWLLAMA_RECONNECTION_INTERVAL_SECONDS` | `5` | Initial retry delay; allowed range 0.1-3600 seconds. Retry backoff is capped at 60 seconds. |
-| `LOWLLAMA_AUTH_TOKEN` | Unset | Reserved opaque credential configuration. The current API instead returns credentials during registration, so this value is not sent by the agent. Never commit a real value. |
-| `LOWLLAMA_STATE_DIR` | Per-user state directory | Optional location for the non-secret local node ID. On Windows the default is `%LOCALAPPDATA%\LowLlama\Agent`. |
+| `LOWLLAMA_STATE_DIR` | Per-user state directory | Holds the local client ID and DPAPI-encrypted server registration. On Windows the default is `%LOCALAPPDATA%\LowLlama\Agent`. |
 
 Example helper configuration:
 
 ```powershell
 $env:LOWLLAMA_COORDINATOR_URL = 'http://100.100.20.30:8000'
 $env:LOWLLAMA_NODE_NAME = 'UBHack Helper 1'
+$env:LOWLLAMA_INVITE_CODE = '<paste-current-invite-here>'
 $env:LOWLLAMA_HEARTBEAT_INTERVAL_SECONDS = '5'
 $env:LOWLLAMA_REQUEST_TIMEOUT_SECONDS = '10'
 $env:LOWLLAMA_RECONNECTION_INTERVAL_SECONDS = '5'
@@ -116,13 +118,21 @@ $env:GGML_RPC_DEBUG = '1'
 ```
 
 In a second project-root PowerShell window, set the agent environment variables
-and start the Python agent:
+and start the Python agent. Set the invite only for first enrollment or after
+the coordinator has explicitly rejected previously stored credentials:
 
 ```powershell
 $env:LOWLLAMA_COORDINATOR_URL = 'http://100.100.20.30:8000'
 $env:LOWLLAMA_NODE_NAME = 'UBHack Helper 1'
+$env:LOWLLAMA_INVITE_CODE = '<paste-current-invite-here>'
 .\.venv\Scripts\python.exe -m agent.agent
 ```
+
+After enrollment succeeds, close that PowerShell window so the invite is no
+longer present in its environment. Future starts need only the coordinator URL
+and node name; the agent loads the coordinator-issued node ID and credential
+from `%LOCALAPPDATA%\LowLlama\Agent\registration.dpapi`. Windows DPAPI binds
+that ciphertext to the current Windows user.
 
 Direct execution is also supported:
 
@@ -130,10 +140,12 @@ Direct execution is also supported:
 .\.venv\Scripts\python.exe .\agent\agent.py
 ```
 
-The agent registers with the configured display name, detected total RAM, and
-RPC port `50052`. It begins heartbeats only after registration succeeds.
-Temporary failures use exponential backoff and do not discard a valid
-registration. Rejected credentials cause a controlled re-registration.
+The agent joins with the invite, configured display name, detected total RAM,
+and RPC port `50052`. It stores the returned identity before starting
+heartbeats. Temporary heartbeat failures use exponential backoff and do not
+discard valid credentials. A restart authenticates the stored identity with a
+heartbeat and does not call `/join` again. Rejected credentials are deleted;
+the agent requires an explicitly supplied invite instead of using `/register`.
 
 ## Verify registration
 
@@ -161,7 +173,7 @@ agent reached the coordinator.
 
 ## Troubleshooting
 
-### The agent keeps reporting `registration_failed`
+### The agent reports `enrollment_connection_failed`
 
 Check Tailscale, the URL, the coordinator process, and port `8000`:
 
@@ -174,9 +186,12 @@ Test-NetConnection $masterIp -Port 8000
 The coordinator must listen on an address reachable through Tailscale. A server
 bound only to its own `127.0.0.1` cannot accept a helper connection.
 
-The agent retries at the configured reconnection interval, then doubles the
-delay up to 60 seconds. Stop the agent rather than opening several copies; each
-copy can create another registration.
+Connection failures before enrollment retry at the configured reconnection
+interval, then double up to 60 seconds. Enrollment timeouts, malformed success
+responses, and server errors fail closed because the server might have created
+a node even though the helper did not receive its credentials. Check `/nodes`
+before obtaining another invite; blindly retrying can create a duplicate until
+the server adds the agreed idempotent `client_id` reconciliation contract.
 
 ### The coordinator responds with 404
 
@@ -201,8 +216,9 @@ rejected because the agent cannot prove that their transport is protected.
 The agent retains the server-issued node ID and credentials during timeouts,
 connection failures, invalid responses, and server errors. It logs
 `heartbeat_failed` once, retries with backoff, and logs `heartbeat_restored`
-after recovery. A `401` or `403` means the credentials were rejected; the agent
-waits and registers again.
+after recovery. A `401` or `403` means the credentials were rejected. The agent
+removes the rejected local registration and exits unless an explicit invite
+was supplied for one controlled re-enrollment attempt.
 
 ### RPC is unreachable from the master
 
@@ -213,7 +229,7 @@ in the root project README. Do not create a public router port forward.
 
 ### Startup reports that RAM could not be detected
 
-The coordinator requires a numeric `ram_gb` registration field. Confirm psutil
+The coordinator requires a numeric `ram_gb` join field. Confirm psutil
 is installed in the selected interpreter:
 
 ```powershell
@@ -247,7 +263,7 @@ Each file can also run directly:
 .\.venv\Scripts\python.exe .\agent\tests\test_agent.py -v
 ```
 
-The delivery baseline is 43 passing agent tests.
+The Phase 1 baseline is 59 passing agent tests.
 
 ## Security considerations
 
@@ -255,12 +271,14 @@ The delivery baseline is 43 passing agent tests.
   address. Do not put credentials on ordinary HTTP networks.
 - Do not expose coordinator port `8000` or RPC port `50052` to the public
   internet. Keep both inside the team's tailnet and restrict firewall rules.
-- Coordinator-issued credentials remain in process memory. They are excluded
-  from object representations and logs and are not persisted to disk.
-- `LOWLLAMA_AUTH_TOKEN`, if ever required by a later contract, must come from
-  the process environment or a proper secret manager. Never commit it.
-- The persistent local `node_id` file is an identifier, not a credential.
-- The agent collects only the requested general system fields. Registration
+- Coordinator-issued credentials are excluded from object representations and
+  logs. At rest they are DPAPI-encrypted for the current Windows user.
+- `LOWLLAMA_INVITE_CODE` must be supplied through the process environment only
+  for enrollment. Never commit it, paste it into logs, or leave it in a shared
+  PowerShell profile.
+- The persistent local `client_id` is an installation identifier, not a server
+  node ID or credential. The current server does not consume it yet.
+- The agent collects only the requested general system fields. Enrollment
   currently sends the display name (hostname by default), total RAM, and RPC
   port. It does not read user files, passwords, browser data, or documents.
 - The client accepts only documented response fields and never executes commands

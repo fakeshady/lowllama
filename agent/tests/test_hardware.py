@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.hardware import get_hardware_info
+from agent.hardware import get_available_ram_gb, get_hardware_info
 
 
 class GetHardwareInfoTests(unittest.TestCase):
@@ -110,6 +110,14 @@ class GetHardwareInfoTests(unittest.TestCase):
         self.assertEqual(result["cpu_core_count"], 20)
         self.assertIsNone(result["total_ram_gb"])
         self.assertIsNone(result["available_ram_gb"])
+
+    @patch("agent.hardware.psutil.virtual_memory")
+    def test_available_ram_probe_is_dynamic_and_safe(self, virtual_memory) -> None:
+        virtual_memory.return_value.available = 5 * 1024**3
+        self.assertEqual(get_available_ram_gb(), 5.0)
+
+        virtual_memory.side_effect = OSError("unavailable")
+        self.assertIsNone(get_available_ram_gb())
         self.assertEqual(
             cpu_count.call_args_list,
             [unittest.mock.call(logical=False), unittest.mock.call(logical=True)],

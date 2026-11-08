@@ -7,11 +7,15 @@ Configuration is read from these environment variables:
     development. Remote coordinators must use HTTPS or a literal Tailscale IP
     address so coordinator-issued credentials are not sent over an unprotected
     connection. Production deployments should set this explicitly.
-``LOWLLAMA_NODE_ID``
-    Stable node identifier. When omitted, a UUID is generated and stored in
-    the local agent state directory.
+``LOWLLAMA_CLIENT_ID``
+    Stable installation identifier. When omitted, a UUID is generated and
+    stored in the local agent state directory. This is not the server-issued
+    node ID and does not authenticate the helper.
 ``LOWLLAMA_NODE_NAME``
     Human-readable display name. Defaults to the computer hostname.
+``LOWLLAMA_INVITE_CODE``
+    First-run or re-enrollment invite. It is retained only in memory, excluded
+    from ``repr()``, and never written to agent configuration files.
 ``LOWLLAMA_HEARTBEAT_INTERVAL_SECONDS``
     Seconds between heartbeats. Defaults to ``5`` so the helper reports well
     before the coordinator's current 10-second offline cutoff.
@@ -19,15 +23,20 @@ Configuration is read from these environment variables:
     HTTP request timeout in seconds. Defaults to ``10``.
 ``LOWLLAMA_RECONNECTION_INTERVAL_SECONDS``
     Seconds to wait before reconnecting. Defaults to ``5``.
-``LOWLLAMA_AUTH_TOKEN``
-    Optional opaque coordinator credential. It is retained only in memory,
-    excluded from ``repr()``, and never written to the node ID file.
+``LOWLLAMA_RPC_HOST``
+    Local llama.cpp RPC listener address checked before each heartbeat.
+    Defaults to ``127.0.0.1``; use the helper's literal Tailscale IP when the
+    RPC server binds there.
+``LOWLLAMA_RPC_PORT``
+    Local llama.cpp RPC listener port. Defaults to ``50052``.
+``LOWLLAMA_RPC_PROBE_TIMEOUT_SECONDS``
+    Maximum seconds spent checking the local RPC listener. Defaults to ``0.5``.
 ``LOWLLAMA_STATE_DIR``
-    Optional location for non-secret local state. Defaults to the Windows
-    Local AppData directory (or the platform's user state directory).
+    Optional location for agent state. Server credentials stored there are
+    encrypted with Windows DPAPI. Defaults to Windows Local AppData (or the
+    platform's user state directory).
 
-There are no built-in production credentials. If the coordinator requires
-authentication, ``LOWLLAMA_AUTH_TOKEN`` must be supplied by the environment.
+There are no built-in production credentials or invite codes.
 """
 
 from __future__ import annotations
@@ -49,9 +58,13 @@ DEFAULT_COORDINATOR_URL = "http://127.0.0.1:8000"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_RECONNECTION_INTERVAL_SECONDS = 5.0
+DEFAULT_RPC_HOST = "127.0.0.1"
+DEFAULT_RPC_PORT = 50052
+DEFAULT_RPC_PROBE_TIMEOUT_SECONDS = 0.5
 
-_NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_NODE_ID_FILENAME = "node_id"
+_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CLIENT_ID_FILENAME = "client_id"
+_LEGACY_NODE_ID_FILENAME = "node_id"
 _TAILSCALE_NETWORKS = (
     ip_network("100.64.0.0/10"),
     ip_network("fd7a:115c:a1e0::/48"),
@@ -67,12 +80,16 @@ class AgentConfig:
     """Validated configuration used by helper-agent modules."""
 
     coordinator_url: str
-    node_id: str
+    client_id: str
     node_display_name: str
     heartbeat_interval_seconds: float
     request_timeout_seconds: float
     reconnection_interval_seconds: float
-    auth_token: str | None = field(default=None, repr=False)
+    rpc_host: str
+    rpc_port: int
+    rpc_probe_timeout_seconds: float
+    state_dir: Path
+    invite_code: str | None = field(default=None, repr=False)
 
 
 def _is_protected_http_host(hostname: str) -> bool:
@@ -129,11 +146,11 @@ def validate_coordinator_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def _validate_node_id(value: str, source: str = "LOWLLAMA_NODE_ID") -> str:
-    """Return a safe node identifier or raise ``ConfigurationError``."""
+def _validate_client_id(value: str, source: str = "LOWLLAMA_CLIENT_ID") -> str:
+    """Return a safe installation identifier or raise ``ConfigurationError``."""
 
     value = value.strip()
-    if not _NODE_ID_PATTERN.fullmatch(value):
+    if not _CLIENT_ID_PATTERN.fullmatch(value):
         raise ConfigurationError(
             f"{source} must be 1-128 characters using letters, digits, '.', '_', ':', or '-'"
         )
@@ -144,10 +161,50 @@ def _validate_display_name(value: str) -> str:
     """Validate the human-readable helper name."""
 
     value = value.strip()
-    if not value or len(value) > 100:
-        raise ConfigurationError("LOWLLAMA_NODE_NAME must contain 1-100 characters")
+    if not value or len(value) > 64:
+        raise ConfigurationError("LOWLLAMA_NODE_NAME must contain 1-64 characters")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ConfigurationError("LOWLLAMA_NODE_NAME must not contain control characters")
+    return value
+
+
+def _validate_rpc_host(value: str) -> str:
+    """Allow only a local loopback or literal Tailscale RPC listener address."""
+
+    value = value.strip()
+    if value.lower() == "localhost":
+        return "localhost"
+    try:
+        address = ip_address(value)
+    except ValueError as exc:
+        raise ConfigurationError(
+            "LOWLLAMA_RPC_HOST must be localhost or a literal loopback/Tailscale IP"
+        ) from exc
+    if not (
+        address.is_loopback
+        or any(
+            address.version == network.version and address in network
+            for network in _TAILSCALE_NETWORKS
+        )
+    ):
+        raise ConfigurationError(
+            "LOWLLAMA_RPC_HOST must be a loopback or Tailscale address"
+        )
+    return str(address)
+
+
+def _parse_port(environment: Mapping[str, str], name: str, default: int) -> int:
+    """Parse a valid TCP port without accepting booleans or fractional values."""
+
+    raw_value = environment.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value.strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ConfigurationError(f"{name} must be a whole number") from exc
+    if str(value) != raw_value.strip() or not 1 <= value <= 65535:
+        raise ConfigurationError(f"{name} must be between 1 and 65535")
     return value
 
 
@@ -175,17 +232,19 @@ def _parse_interval(
     return value
 
 
-def _validate_auth_token(environment: Mapping[str, str]) -> str | None:
-    """Read the optional in-memory token without providing a secret default."""
+def _validate_invite_code(environment: Mapping[str, str]) -> str | None:
+    """Read an optional invite without logging or persisting it."""
 
-    if "LOWLLAMA_AUTH_TOKEN" not in environment:
+    if "LOWLLAMA_INVITE_CODE" not in environment:
         return None
-    token = environment["LOWLLAMA_AUTH_TOKEN"].strip()
-    if not token:
-        raise ConfigurationError("LOWLLAMA_AUTH_TOKEN must not be empty when set")
-    if len(token) > 4096:
-        raise ConfigurationError("LOWLLAMA_AUTH_TOKEN is unexpectedly long")
-    return token
+    invite_code = environment["LOWLLAMA_INVITE_CODE"].strip()
+    if not invite_code:
+        raise ConfigurationError("LOWLLAMA_INVITE_CODE must not be empty when set")
+    if len(invite_code) > 8192:
+        raise ConfigurationError("LOWLLAMA_INVITE_CODE is unexpectedly long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in invite_code):
+        raise ConfigurationError("LOWLLAMA_INVITE_CODE contains control characters")
+    return invite_code
 
 
 def _default_state_dir(environment: Mapping[str, str]) -> Path:
@@ -210,54 +269,63 @@ def _default_state_dir(environment: Mapping[str, str]) -> Path:
     return Path.home() / ".local" / "state" / "lowllama"
 
 
-def _read_node_id(path: Path) -> str:
-    """Read and validate a previously persisted node ID."""
+def _read_client_id(path: Path) -> str:
+    """Read and validate a previously persisted installation ID."""
 
     try:
         value = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ConfigurationError(f"Unable to read persistent node ID from {path}") from exc
-    return _validate_node_id(value, f"persistent node ID in {path}")
+        raise ConfigurationError(f"Unable to read persistent client ID from {path}") from exc
+    return _validate_client_id(value, f"persistent client ID in {path}")
 
 
-def _load_or_create_node_id(state_dir: Path) -> str:
-    """Atomically create or reuse the helper's stable local UUID."""
+def _persist_client_id(path: Path, client_id: str) -> str:
+    """Atomically persist a validated installation identifier."""
 
-    node_id_path = state_dir / _NODE_ID_FILENAME
-    if node_id_path.exists():
-        return _read_node_id(node_id_path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return _read_client_id(path)
+    except OSError as exc:
+        raise ConfigurationError(f"Unable to persist client ID at {path}") from exc
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as client_id_file:
+            client_id_file.write(f"{client_id}\n")
+    except OSError as exc:
+        raise ConfigurationError(f"Unable to persist client ID at {path}") from exc
+    return client_id
+
+
+def _load_or_create_client_id(state_dir: Path) -> str:
+    """Atomically create, migrate, or reuse the helper installation UUID."""
+
+    client_id_path = state_dir / _CLIENT_ID_FILENAME
+    if client_id_path.exists():
+        return _read_client_id(client_id_path)
 
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ConfigurationError(f"Unable to create agent state directory {state_dir}") from exc
 
-    generated_id = str(uuid.uuid4())
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        descriptor = os.open(node_id_path, flags, 0o600)
-    except FileExistsError:
-        # Another agent process won the creation race; use its identity.
-        return _read_node_id(node_id_path)
-    except OSError as exc:
-        raise ConfigurationError(f"Unable to persist node ID at {node_id_path}") from exc
+    legacy_path = state_dir / _LEGACY_NODE_ID_FILENAME
+    if legacy_path.exists():
+        legacy_id = _read_client_id(legacy_path)
+        return _persist_client_id(client_id_path, legacy_id)
 
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as node_id_file:
-            node_id_file.write(f"{generated_id}\n")
-    except OSError as exc:
-        raise ConfigurationError(f"Unable to persist node ID at {node_id_path}") from exc
-    return generated_id
+    return _persist_client_id(client_id_path, str(uuid.uuid4()))
 
 
-def _default_display_name(node_id: str) -> str:
+def _default_display_name(client_id: str) -> str:
     """Use the hostname when available and a non-secret fallback otherwise."""
 
     try:
         hostname = socket.gethostname().strip()
     except Exception:
         hostname = ""
-    return hostname or f"helper-{node_id[:8]}"
+    return hostname or f"helper-{client_id[:8]}"
 
 
 def load_config(
@@ -274,27 +342,34 @@ def load_config(
 
     environment = os.environ if environment is None else environment
 
-    configured_node_id = environment.get("LOWLLAMA_NODE_ID")
-    if configured_node_id is not None:
-        node_id = _validate_node_id(configured_node_id)
-    else:
-        resolved_state_dir = (
-            Path(state_dir).expanduser()
-            if state_dir is not None
-            else _default_state_dir(environment)
+    if "LOWLLAMA_NODE_ID" in environment:
+        raise ConfigurationError(
+            "LOWLLAMA_NODE_ID is ambiguous; use LOWLLAMA_CLIENT_ID for the local installation ID"
         )
-        node_id = _load_or_create_node_id(resolved_state_dir)
+
+    resolved_state_dir = (
+        Path(state_dir).expanduser()
+        if state_dir is not None
+        else _default_state_dir(environment)
+    )
+    configured_client_id = environment.get("LOWLLAMA_CLIENT_ID")
+    if configured_client_id is not None:
+        client_id = _validate_client_id(configured_client_id)
+    else:
+        client_id = _load_or_create_client_id(resolved_state_dir)
 
     configured_name = environment.get("LOWLLAMA_NODE_NAME")
     node_display_name = _validate_display_name(
-        configured_name if configured_name is not None else _default_display_name(node_id)
+        configured_name
+        if configured_name is not None
+        else _default_display_name(client_id)
     )
 
     return AgentConfig(
         coordinator_url=validate_coordinator_url(
             environment.get("LOWLLAMA_COORDINATOR_URL", DEFAULT_COORDINATOR_URL)
         ),
-        node_id=node_id,
+        client_id=client_id,
         node_display_name=node_display_name,
         heartbeat_interval_seconds=_parse_interval(
             environment,
@@ -317,7 +392,19 @@ def load_config(
             minimum=0.1,
             maximum=3600,
         ),
-        auth_token=_validate_auth_token(environment),
+        rpc_host=_validate_rpc_host(
+            environment.get("LOWLLAMA_RPC_HOST", DEFAULT_RPC_HOST)
+        ),
+        rpc_port=_parse_port(environment, "LOWLLAMA_RPC_PORT", DEFAULT_RPC_PORT),
+        rpc_probe_timeout_seconds=_parse_interval(
+            environment,
+            "LOWLLAMA_RPC_PROBE_TIMEOUT_SECONDS",
+            DEFAULT_RPC_PROBE_TIMEOUT_SECONDS,
+            minimum=0.05,
+            maximum=10,
+        ),
+        state_dir=resolved_state_dir,
+        invite_code=_validate_invite_code(environment),
     )
 
 

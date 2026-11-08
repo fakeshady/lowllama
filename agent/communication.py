@@ -2,8 +2,10 @@
 
 The coordinator contract is defined in ``coordinator/main.py``:
 
-* ``POST /register`` accepts ``node_name``, ``ram_gb``, and ``rpc_port``.
-* ``POST /heartbeat`` accepts ``node_id`` and ``credentials``.
+* ``POST /join`` accepts ``invite_code``, ``node_name``, ``ram_gb``, and
+  ``rpc_port`` plus the local ``client_id``.
+* ``POST /reconnect`` authenticates a stored ``node_id`` and ``credentials``.
+* ``POST /heartbeat`` accepts credentials plus resource and RPC state.
 
 This module deliberately contains no server, registry, invitation, or agent
 orchestration logic.
@@ -51,6 +53,14 @@ class CoordinatorAuthenticationError(CoordinatorHTTPError):
     """Raised for HTTP 401 or 403 authentication failures."""
 
 
+class CoordinatorEnrollmentError(CoordinatorHTTPError):
+    """Raised when the coordinator rejects helper enrollment."""
+
+
+class CoordinatorEnrollmentConflictError(CoordinatorEnrollmentError):
+    """Raised when a client installation is already enrolled."""
+
+
 class InvalidCoordinatorResponseError(CommunicationError):
     """Raised when a successful response does not match the API contract."""
 
@@ -66,6 +76,20 @@ class RegistrationResult:
 @dataclass(frozen=True, slots=True)
 class HeartbeatResult:
     """Status returned by a successful heartbeat."""
+
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class HealthResult:
+    """Status returned by the coordinator health route."""
+
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReconnectResult:
+    """Status returned after authenticating stored coordinator credentials."""
 
     status: str
 
@@ -113,25 +137,64 @@ class CoordinatorClient:
         self._opener = opener or build_opener()
         self._logger = logger or LOGGER
 
-    def register(self, node_name: str, ram_gb: float, rpc_port: int) -> RegistrationResult:
-        """Register a helper using the coordinator's ``POST /register`` contract."""
+    def check_health(self) -> HealthResult:
+        """Check coordinator readiness before attempting non-idempotent enrollment."""
+
+        response = self._get_json("/health", operation="health")
+        status = self._required_nonempty_string(response, "status", "health")
+        if status != "healthy":
+            self._log(logging.ERROR, "coordinator_invalid_response", operation="health")
+            raise InvalidCoordinatorResponseError(
+                "Coordinator health response is not healthy"
+            )
+        return HealthResult(status=status)
+
+    def join(
+        self,
+        invite_code: str,
+        node_name: str,
+        ram_gb: float,
+        rpc_port: int,
+        client_id: str,
+    ) -> RegistrationResult:
+        """Enroll a helper using the coordinator's approved ``POST /join`` route."""
 
         response = self._post_json(
-            "/register",
+            "/join",
             {
+                "invite_code": invite_code,
                 "node_name": node_name,
                 "ram_gb": ram_gb,
                 "rpc_port": rpc_port,
+                "client_id": client_id,
             },
-            operation="register",
+            operation="join",
         )
-        node_id = self._required_nonempty_string(response, "node_id", "register")
+        node_id = self._required_nonempty_string(response, "node_id", "join")
         credentials = self._required_nonempty_string(
-            response, "credentials", "register"
+            response, "credentials", "join"
         )
         return RegistrationResult(node_id=node_id, credentials=credentials)
 
-    def send_heartbeat(self, node_id: str, credentials: str) -> HeartbeatResult:
+    def reconnect(self, node_id: str, credentials: str) -> ReconnectResult:
+        """Authenticate a stored node identity without creating a new entry."""
+
+        response = self._post_json(
+            "/reconnect",
+            {"node_id": node_id, "credentials": credentials},
+            operation="reconnect",
+        )
+        status = self._required_nonempty_string(response, "status", "reconnect")
+        return ReconnectResult(status=status)
+
+    def send_heartbeat(
+        self,
+        node_id: str,
+        credentials: str,
+        *,
+        free_ram_gb: float | None = None,
+        rpc_ready: bool = False,
+    ) -> HeartbeatResult:
         """Send a helper heartbeat using the coordinator-issued credential."""
 
         response = self._post_json(
@@ -139,6 +202,8 @@ class CoordinatorClient:
             {
                 "node_id": node_id,
                 "credentials": credentials,
+                "free_ram_gb": free_ram_gb,
+                "rpc_ready": rpc_ready,
             },
             operation="heartbeat",
         )
@@ -154,13 +219,31 @@ class CoordinatorClient:
     ) -> dict[str, Any]:
         """POST JSON and return a validated top-level JSON object."""
 
-        url = f"{self._coordinator_url}{path}"
         request = Request(
-            url,
+            f"{self._coordinator_url}{path}",
             data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             method="POST",
         )
+        return self._send_json_request(request, operation)
+
+    def _get_json(self, path: str, *, operation: str) -> dict[str, Any]:
+        """GET JSON and return a validated top-level JSON object."""
+
+        request = Request(
+            f"{self._coordinator_url}{path}",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        return self._send_json_request(request, operation)
+
+    def _send_json_request(
+        self,
+        request: Request,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Send one prepared request and translate transport/response failures."""
+
         self._log(logging.DEBUG, "coordinator_request_started", operation=operation)
 
         try:
@@ -223,6 +306,24 @@ class CoordinatorClient:
         self, status_code: int, detail: object | None, operation: str
     ) -> None:
         """Translate an unsuccessful status into the appropriate exception."""
+
+        if operation == "join" and status_code in {400, 401, 403}:
+            self._log(
+                logging.WARNING,
+                "coordinator_enrollment_rejected",
+                operation=operation,
+                status_code=status_code,
+            )
+            raise CoordinatorEnrollmentError(status_code, detail)
+
+        if operation == "join" and status_code == 409:
+            self._log(
+                logging.WARNING,
+                "coordinator_enrollment_conflict",
+                operation=operation,
+                status_code=status_code,
+            )
+            raise CoordinatorEnrollmentConflictError(status_code, detail)
 
         if status_code in {401, 403}:
             self._log(
