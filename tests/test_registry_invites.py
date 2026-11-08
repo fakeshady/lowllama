@@ -377,5 +377,91 @@ class InviteSafetyTests(unittest.TestCase):
         except invites.InviteError as e: self.assertNotIn(token,str(e)); self.assertNotIn(code,str(e))
 
 
+class FakeClock:
+    """Stands in for registry._now / invites._now so timeouts can be checked to the exact second."""
+    def __init__(self, start=1_000_000.0): self.t=start
+    def __call__(self): return self.t
+
+
+class TimeoutBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        registry.clear(); invites.clear()
+        self.clock=FakeClock()
+        for module in (registry,invites):
+            p=mock.patch.object(module,"_now",self.clock); p.start(); self.addCleanup(p.stop)
+
+    def test_online_until_exactly_offline_after_then_offline(self):
+        a=registry.register_node("Helper",16,50052)
+        self.clock.t+=registry.OFFLINE_AFTER-0.01
+        self.assertEqual(registry.get_node(a["node_id"])["status"],"online")   # just before
+        self.clock.t+=0.01
+        self.assertEqual(registry.get_node(a["node_id"])["status"],"online")   # exactly 10 s still counts
+        self.clock.t+=0.01
+        self.assertEqual(registry.get_node(a["node_id"])["status"],"offline")   # just after
+        self.assertEqual(registry.online_nodes(),[])
+
+    def test_heartbeat_resets_the_timer_and_brings_node_back(self):
+        a=registry.register_node("Helper",16,50052)
+        self.clock.t+=60
+        self.assertEqual(registry.get_node(a["node_id"])["status"],"offline")
+        self.assertTrue(registry.update_heartbeat(a["node_id"],a["credentials"]))
+        node=registry.get_node(a["node_id"])
+        self.assertEqual((node["status"],node["last_seen_s"]),("online",0.0))
+        self.clock.t+=registry.OFFLINE_AFTER+0.5
+        self.assertEqual(registry.get_node(a["node_id"])["status"],"offline")
+
+    def test_offline_node_keeps_its_old_rpc_ready_claim_but_is_not_online(self):
+        a=registry.register_node("Helper",16,50052,rpc_ready=True)
+        self.clock.t+=registry.OFFLINE_AFTER+1
+        node=registry.get_node(a["node_id"])
+        self.assertEqual((node["status"],node["rpc_ready"]),("offline",True))   # the claim is stale; status is what counts
+        self.assertEqual(registry.online_nodes(),[])
+
+    def test_invite_valid_until_exact_expiry(self):
+        code=invites.create_invite("100.64.0.1",ttl_min=1)["invite_code"]
+        self.clock.t+=59.5
+        self.assertTrue(invites.validate_and_use_invite(code))
+        self.clock.t+=0.5
+        self.assertTrue(invites.validate_and_use_invite(code))   # at the stored expiry second it still works
+        self.clock.t+=0.01
+        self.assertFalse(invites.validate_and_use_invite(code))
+
+
+class CoordinatorRestartPolicyTests(unittest.TestCase):
+    """registry.clear() + invites.clear() simulate the coordinator restarting (all state is in memory)."""
+
+    def setUp(self): registry.clear(); invites.clear()
+
+    def test_helper_restart_keeps_identity(self):
+        a=registry.register_node("Helper",16,50052,client_id="install-a")
+        self.assertEqual(registry.reconnect_node(a["node_id"],a["credentials"]),a)
+        self.assertEqual([n["node_id"] for n in registry.get_all_nodes()],[a["node_id"]])
+
+    def test_coordinator_restart_invalidates_everything_until_reenrollment(self):
+        old_code=invites.create_invite("100.64.0.1")["invite_code"]
+        a=registry.register_node("Helper",16,50052,client_id="install-a")
+        registry.clear(); invites.clear()   # coordinator restarted
+        self.assertFalse(registry.update_heartbeat(a["node_id"],a["credentials"]))
+        with self.assertRaises(registry.NodeAuthError): registry.reconnect_node(a["node_id"],a["credentials"])
+        self.assertFalse(invites.validate_and_use_invite(old_code))   # old invites die too
+        new_code=invites.create_invite("100.64.0.1")["invite_code"]   # admin issues a NEW invite
+        self.assertTrue(invites.validate_and_use_invite(new_code))
+        b=registry.register_node("Helper",16,50052,client_id="install-a")   # deliberate re-enrollment, same install
+        self.assertNotEqual(b["node_id"],a["node_id"])   # new identity: nothing is persisted
+        self.assertEqual(len(registry.get_all_nodes()),1)
+
+    def test_client_id_alone_cannot_recover_an_existing_node(self):
+        registry.register_node("Helper",16,50052,client_id="install-a")
+        with self.assertRaises(registry.NodeConflictError): registry.register_node("Helper",16,50052,client_id="install-a")
+
+
+class AddressTrustTests(unittest.TestCase):
+    def setUp(self): registry.clear()
+
+    def test_hostnames_and_proxy_style_values_are_rejected(self):
+        for bad in ("testclient","localhost","100.64.0.2, 10.0.0.1","::ffff:8.8.8.8","169.254.1.1"):
+            with self.assertRaises(registry.InvalidNodeData): registry.register_node("Helper",16,50052,address=bad)
+
+
 if __name__=="__main__":
     unittest.main(verbosity=2)

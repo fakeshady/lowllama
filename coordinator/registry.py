@@ -1,11 +1,11 @@
 """Node registry: stores every laptop that joined and works out online/offline.
 
 coordinator/main.py calls these functions from the endpoints:
-    POST /register, POST /join -> registry.register_node(name, ram, port)        -> {"node_id", "credentials"}
-    POST /heartbeat            -> registry.update_heartbeat(node_id, credentials) -> True/False
-    GET  /nodes                -> registry.get_all_nodes()
-Proposed (needs Rodel to expose it, Itmam to call it):
-    reconnect                  -> registry.reconnect_node(node_id, credentials, ...) -> same {"node_id", "credentials"}
+    POST /register (admin), POST /join (invite) -> registry.register_node(name, ram, port, address=, client_id=) -> {"node_id", "credentials"}
+    POST /reconnect -> registry.reconnect_node(node_id, credentials, ...)                     -> same {"node_id", "credentials"}
+    POST /heartbeat -> registry.update_heartbeat(node_id, credentials, free_ram_gb, rpc_ready) -> True/False
+    GET  /nodes     -> registry.get_all_nodes()
+The registry is NOT the auth gate: callers must check the admin token or a valid invite before register_node.
 
 Identity rules:
     - The server issues node_id + credentials. Only the credentials prove who a node is.
@@ -13,7 +13,14 @@ Identity rules:
     - A helper that restarts calls reconnect_node with its saved credentials: same entry, no duplicate.
     - A helper that lost its credentials cannot take over its old entry: an admin calls remove() and the
       helper enrolls again with a new invite, getting a new node_id (identity rotation).
-Everything lives in memory: restarting the coordinator forgets every node, and helpers must enroll again.
+
+Status: "online" means the coordinator received a heartbeat (by its own clock) within OFFLINE_AFTER seconds.
+rpc_ready is only what the helper reports; neither proves llama.cpp RPC works or that the node computed anything.
+
+Restart policy (MVP): everything lives in memory. A HELPER restart keeps its node_id via reconnect_node.
+A COORDINATOR restart forgets every node: old credentials stop working (reconnect -> NodeAuthError) and the
+helper must get a NEW invite and enroll again, receiving a new node_id. Persistence (e.g. SQLite) is a possible
+future option that the team has not approved or built.
 
 Errors (all messages are safe to show; none contain secrets):
     InvalidNodeData (a ValueError) -> bad name/RAM/port/address/flag            -> HTTP 400 or 422
@@ -39,6 +46,10 @@ class NodeAuthError(Exception): pass
 class NodeConflictError(Exception): pass
 
 
+def _now():
+    return time.time()   # the coordinator's clock; tests replace this to check exact timeout boundaries
+
+
 def register_node(name, ram, port=DEFAULT_RPC_PORT, address=None, free_ram_gb=None, rpc_ready=False, client_id=None):
     """Enroll a laptop. Returns its new node_id and the secret credentials it must keep and send back.
 
@@ -49,7 +60,7 @@ def register_node(name, ram, port=DEFAULT_RPC_PORT, address=None, free_ram_gb=No
     fields["free_ram_gb"]=_clean_free_ram(free_ram_gb,fields["ram_gb"])
     client_id=_clean_client_id(client_id)
     credentials=secrets.token_urlsafe(24)
-    now=time.time()
+    now=_now()
     with _lock:
         if client_id is not None and client_id in _by_client:
             raise NodeConflictError("this helper is already enrolled; reconnect with its saved credentials, or ask the admin to remove the old entry")
@@ -77,7 +88,7 @@ def reconnect_node(node_id, credentials, name=None, ram=None, port=None, free_ra
         if free_ram_gb is not None: updates["free_ram_gb"]=_clean_free_ram(free_ram_gb,total)
         elif node["free_ram_gb"] is not None and node["free_ram_gb"]>total: updates["free_ram_gb"]=None   # old value no longer possible
         node.update(updates)
-        node["last_seen"]=time.time()   # coordinator's own clock
+        node["last_seen"]=_now()   # coordinator's own clock
         return {"node_id":node["node_id"],"credentials":node["credentials"]}
 
 
@@ -93,7 +104,7 @@ def update_heartbeat(node_id, credentials, free_ram_gb=None, rpc_ready=None):
         if node is None: return False
         if free_ram_gb is not None: node["free_ram_gb"]=_clean_free_ram(free_ram_gb,node["ram_gb"])
         if rpc_ready is not None: node["rpc_ready"]=rpc_ready
-        node["last_seen"]=time.time()   # coordinator's own clock, not the helper's
+        node["last_seen"]=_now()   # coordinator's own clock, not the helper's
         return True
 
 
@@ -206,7 +217,7 @@ def _clean_client_id(client_id):
 
 
 def _public(node):
-    age=time.time()-node["last_seen"]
+    age=_now()-node["last_seen"]
     out={k:v for k,v in node.items() if k not in _HIDDEN}   # new dict of plain values, safe to hand out
     out["status"]="online" if age<=OFFLINE_AFTER else "offline"
     out["last_seen_s"]=round(age,1)   # seconds since last heartbeat, nice for the dashboard

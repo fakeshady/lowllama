@@ -13,7 +13,8 @@ Rules:
       address and use it to join until it expires. Treat it like a password and never log it.
     - Expiry is checked against what this master stored, never against the expiry written inside the code.
     - Invites only let a laptop join the LowLlama pool. They do not add it to the Tailscale network.
-    - Everything lives in memory: restarting the coordinator cancels every code.
+    - Everything lives in memory: restarting the coordinator cancels every code (and forgets every node), so
+      helpers need a NEW invite after a coordinator restart. Persistence is a future option, not built.
 
 Errors: every failure raises InviteError (message safe to show, never contains the code or token).
     create_invite without a usable master address -> InviteError -> HTTP 503 (server not configured)
@@ -33,6 +34,10 @@ _lock=threading.Lock()
 class InviteError(Exception): pass
 
 
+def _now():
+    return time.time()   # the coordinator's clock; tests replace this to check exact expiry boundaries
+
+
 def create_invite(master_ip=None, port=DEFAULT_PORT, ttl_min=DEFAULT_TTL_MIN):
     """Make a new invite code. master_ip defaults to the LOWLLAMA_MASTER_IP environment variable.
 
@@ -42,7 +47,7 @@ def create_invite(master_ip=None, port=DEFAULT_PORT, ttl_min=DEFAULT_TTL_MIN):
     port=_clean_port(port)
     ttl_min=_clean_ttl(ttl_min)
     token=secrets.token_urlsafe(16)
-    now=time.time()
+    now=_now()
     expires=int(now+ttl_min*60)
     with _lock:
         for old in [t for t,exp in _invites.items() if exp<now]: del _invites[old]   # forget expired codes so the dict can't grow forever
@@ -78,7 +83,7 @@ def validate(code):
     payload=decode(code)
     with _lock: expires=_invites.get(payload["token"])
     if expires is None: raise InviteError("invite code was not issued by this master, was cancelled, or the master restarted")
-    if time.time()>expires: raise InviteError("invite code expired")   # trust our stored expiry, not the code's
+    if _now()>expires: raise InviteError("invite code expired")   # trust our stored expiry, not the code's
     return payload
 
 
