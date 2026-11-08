@@ -96,6 +96,14 @@ class CandidateSelection:
         """Comma-separated endpoints in candidate order, e.g. for llama-server --rpc. Empty string if none."""
         return ",".join(w.endpoint for w in self.candidates)
 
+    def selected_rejections(self):
+        """Rejections of nodes the caller ASKED for (everything except not_selected).
+
+        Non-empty means an explicit selection cannot be honoured in full, so /start should refuse with these
+        reasons instead of silently starting with fewer workers than were selected.
+        """
+        return tuple(r for r in self.rejected if r.reason!=NOT_SELECTED)
+
     def as_dict(self):
         return {"candidates":[w.as_dict() for w in self.candidates],"rejected":[r.as_dict() for r in self.rejected]}
 
@@ -142,6 +150,10 @@ def get_candidates(node_ids=None):
 
     Returns a CandidateSelection (.candidates, .rejected, .rpc_endpoints(), .as_dict()). /start requires a
     non-empty node_ids list and refuses (400) when .candidates is empty; .rejected says why each node was left out.
+    Partial-selection policy: if .selected_rejections() is non-empty, one of the chosen nodes is unusable and
+    /start must refuse with those reasons rather than start with fewer workers.
+    Labels: a candidate is only "worth probing". "RPC-compatible" needs the launcher's --list-devices probe, and
+    "proved computing" needs remote model-weight allocation plus fresh graph_compute lines on that helper.
     """
     return get_candidate_workers(selected_node_ids=node_ids)
 

@@ -94,6 +94,26 @@ class WorkerSelectionTests(unittest.TestCase):
         missing=[r for r in sel.rejected if r.node_id=="node-missing"][0]
         self.assertIsNone(missing.node_name)
 
+    def test_selected_rejections_excludes_only_not_selected(self):
+        a=self.add("A",address="100.64.0.2")
+        b=self.add("B",address="100.64.0.3",ready=False)
+        c=self.add("C",address="100.64.0.4")
+        full=workers.get_candidates([a,c])
+        self.assertEqual(self.ids(full),[a,c])
+        self.assertEqual(full.selected_rejections(),())   # b is only "not_selected": the selection is complete
+        partial=workers.get_candidates([a,b,"node-missing"])
+        self.assertEqual(self.ids(partial),[a])   # one survivor, so /start must not report 3 workers
+        self.assertEqual({r.node_id:r.reason for r in partial.selected_rejections()},
+                         {b:workers.RPC_NOT_READY,"node-missing":workers.UNKNOWN_NODE})
+        self.assertNotIn(c,[r.node_id for r in partial.selected_rejections()])
+
+    def test_worker_lost_after_selection_is_not_hidden_by_a_stale_selection(self):
+        a=self.add("A",address="100.64.0.2")
+        sel=workers.get_candidates([a])
+        self.clock[0]+=registry.OFFLINE_AFTER+1   # helper dies between /start's selection and the launcher probe
+        self.assertEqual(sel.rpc_endpoints(),"100.64.0.2:50052")   # the snapshot is frozen: only the launcher's probe can catch this
+        self.assertEqual(self.reasons(workers.get_candidates([a])),{a:workers.OFFLINE})   # a fresh selection sees it
+
     def test_selecting_nothing_gives_nothing(self):
         a=self.add("A")
         sel=workers.get_candidate_workers(selected_node_ids=[])

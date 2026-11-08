@@ -191,6 +191,30 @@ def _has_route(path):
     return any(getattr(r,"path",None)==path for r in app.routes)
 
 
+DEMO_MODEL_ID="qwen2.5-0.5b-instruct-q4_k_m"   # the shared Phase 2 demo model (launcher.MODEL_ALLOWLIST is the one catalog)
+
+
+def _launcher_models():
+    import importlib
+    return dict(importlib.import_module("coordinator.launcher").MODEL_ALLOWLIST)
+
+
+_LAUNCHER_WAS_LOADED=None
+
+
+def setUpModule():
+    global _LAUNCHER_WAS_LOADED
+    _LAUNCHER_WAS_LOADED="coordinator.launcher" in sys.modules
+
+
+def tearDownModule():   # leave the import state as we found it, so other files' sys.modules mocks still work
+    import coordinator
+    if _LAUNCHER_WAS_LOADED is False:
+        launcher=sys.modules.pop("coordinator.launcher",None)
+        if launcher is not None: launcher.stop()   # nothing should be running, but never leave a child behind
+        if hasattr(coordinator,"launcher"): delattr(coordinator,"launcher")
+
+
 @unittest.skipUnless(_has_route("/start"),"this checkout's main.py has no POST /start yet")
 class StartHandoffTests(unittest.TestCase):
     """POST /start -> workers.get_candidates -> launcher.start(model_id, selection).
@@ -225,16 +249,12 @@ class StartHandoffTests(unittest.TestCase):
             from coordinator import launcher as real_launcher   # Itmam's real module: replace its functions only,
             for name,fn in stand_ins.items():                   # so this works no matter which test imported it first
                 p=mock.patch.object(real_launcher,name,fn); p.start(); self.addCleanup(p.stop)
-            # Rodel: sync with real allowlist
-            self.model = next(iter(real_launcher.MODEL_ALLOWLIST))
-            p_models = mock.patch("coordinator.launcher.MODEL_ALLOWLIST", real_launcher.MODEL_ALLOWLIST)
-            p_models.start(); self.addCleanup(p_models.stop)
         except ImportError:   # older checkout without launcher.py: inject a whole stand-in module
             fake=types.ModuleType("coordinator.launcher")
-            fake.MODEL_ALLOWLIST = {"llama-3-8b": "path"}
             for name,fn in stand_ins.items(): setattr(fake,name,fn)
             mods=mock.patch.dict(sys.modules,{"coordinator.launcher":fake}); mods.start(); self.addCleanup(mods.stop)
-            self.model = "llama-3-8b"
+        api_models=getattr(main,"ALLOWED_MODELS",None) or _launcher_models()   # survives Rodel switching to the launcher's catalog
+        self.model=DEMO_MODEL_ID if DEMO_MODEL_ID in api_models else next(iter(api_models))   # a model /start accepts today
 
     def ready(self, name, address, free=8.0):
         a=registry.register_node(name,16,50052,address=address,free_ram_gb=free,rpc_ready=True)
@@ -248,16 +268,45 @@ class StartHandoffTests(unittest.TestCase):
         self.assertEqual(self.start({"model_id":"../../evil.gguf"})[0],400)
         self.assertEqual(self.calls,[])   # launcher never reached
 
-    def test_selected_nodes_reach_the_launcher_with_reasons_for_the_rest(self):
+    def test_selected_nodes_reach_the_launcher_and_others_are_marked_not_selected(self):
         a=self.ready("Ready16","100.64.0.2",free=9.5)
         b=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]
-        status,body=self.start({"model_id":self.model,"node_ids":[a,b,"node-missing"]})
+        status,body=self.start({"model_id":self.model,"node_ids":[a]})
         self.assertEqual(status,200,body)
         self.assertEqual(body["worker_ids"],[a])
         (model_id,selection),=self.calls
         self.assertEqual(model_id,self.model)
         self.assertEqual(selection.rpc_endpoints(),"100.64.0.2:50052")
-        self.assertEqual({r.node_id:r.reason for r in selection.rejected},{b:"rpc_not_ready","node-missing":"unknown_node"})
+        self.assertEqual({r.node_id:r.reason for r in selection.rejected},{b:"not_selected"})
+        self.assertEqual(selection.selected_rejections(),())
+
+    @unittest.expectedFailure   # RODEL GAP (main.py): /start still launches the survivors; remove this marker once fixed
+    def test_partial_selection_is_refused_with_the_rejected_workers_named(self):
+        a=self.ready("Ready16","100.64.0.2",free=9.5)
+        b=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]
+        status,body=self.start({"model_id":self.model,"node_ids":[a,b,"node-missing"]})
+        self.assertIn(status,(400,409),body)   # asked for 3 workers, only 1 usable: refuse, don't start with fewer
+        self.assertEqual(self.calls,[])
+        text=json.dumps(body)
+        for node_id in (b,"node-missing"): self.assertIn(node_id,text)   # say WHICH selected workers were rejected
+
+    def test_every_launcher_model_including_the_demo_is_accepted_by_start(self):   # fixed by Rodel in e127f2d
+        a=self.ready("Ready","100.64.0.2")
+        self.assertIn(DEMO_MODEL_ID,_launcher_models())
+        for model_id in _launcher_models():
+            with self.subTest(model_id=model_id):
+                status,body=self.start({"model_id":model_id,"node_ids":[a]})
+                self.assertEqual(status,200,body)
+        self.assertEqual([m for m,_ in self.calls],list(_launcher_models()))
+
+    def test_start_refuses_models_the_launcher_does_not_know(self):   # fixed by Rodel in e127f2d
+        from coordinator import main
+        a=self.ready("Ready","100.64.0.2")
+        api_only=[m for m in getattr(main,"ALLOWED_MODELS",{}) if m not in _launcher_models()]
+        for model_id in api_only+["qwen2.5-7b","../../evil.gguf"]:   # the old API-only ID must stay refused
+            with self.subTest(model_id=model_id):
+                self.assertEqual(self.start({"model_id":model_id,"node_ids":[a]})[0],400)
+        self.assertEqual(self.calls,[])
 
     def test_selection_order_is_kept_even_against_free_ram(self):
         low=self.ready("Low","100.64.0.2",free=2.0)
@@ -281,6 +330,71 @@ class StartHandoffTests(unittest.TestCase):
             status,_=self.start({"model_id":self.model,"node_ids":ids})
             self.assertIn(status,(400,409,503),ids)
         self.assertEqual(self.calls,[])
+
+    @unittest.expectedFailure   # RODEL BUG (main.py e127f2d): selection.rejected is a tuple, .items() crashes, detail shows the crash text
+    def test_refusal_names_each_rejected_worker_and_its_reason(self):
+        not_ready=registry.register_node("NotReady",8,50052,address="100.64.0.3")["node_id"]
+        status,body=self.start({"model_id":self.model,"node_ids":[not_ready,"node-missing"]})
+        self.assertEqual(status,400,body)
+        text=json.dumps(body)
+        self.assertNotIn("attribute",text)   # no Python error text leaking into the API
+        for expected in (not_ready,"rpc_not_ready","node-missing","unknown_node"): self.assertIn(expected,text)
+
+
+@unittest.skipUnless(_has_route("/start"),"this checkout's main.py has no POST /start yet")
+class StartWithRealLauncherTests(unittest.TestCase):
+    """POST /start through the REAL workers AND the REAL launcher. Only the outside world is faked: the binary and
+    model paths, the TCP connection to the helper, and Popen. No llama-server runs; this is NOT a live RPC test.
+    """
+    @classmethod
+    def setUpClass(cls): cls.http=_Http()
+
+    @classmethod
+    def tearDownClass(cls): cls.http.close()
+
+    def setUp(self):
+        import importlib, tempfile
+        from pathlib import Path
+        from coordinator import main
+        self.launcher=importlib.import_module("coordinator.launcher")
+        registry.clear(); invites.clear()
+        env=mock.patch.dict(os.environ,ENV); env.start(); self.addCleanup(env.stop)
+        self.addCleanup(registry.clear)
+        self.launcher.stop(); self.addCleanup(self.launcher.stop)
+        tmp=tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        binary=Path(tmp.name)/"llama-server.exe"; model=Path(tmp.name)/"model.gguf"
+        binary.write_bytes(b"x"); model.write_bytes(b"x")
+        for p in (mock.patch.object(self.launcher,"_resolve_runtime",lambda model_id: (binary,model)),   # fake files, real everything else
+                  mock.patch.object(self.launcher,"_ensure_server_port_available")):
+            p.start(); self.addCleanup(p.stop)
+        api_models=getattr(main,"ALLOWED_MODELS",None) or _launcher_models()
+        self.model=DEMO_MODEL_ID if DEMO_MODEL_ID in api_models else next(iter(api_models))
+
+    def test_worker_lost_between_selection_and_probe_fails_without_starting(self):
+        nid=registry.register_node("Helper",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
+        with (mock.patch.object(self.launcher.socket,"create_connection",side_effect=ConnectionRefusedError()) as connect,   # helper just died
+              mock.patch.object(self.launcher.subprocess,"Popen") as popen):
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[nid]},ADMIN_HEADER)
+        self.assertNotEqual(status,200,body)   # registry still said online + rpc_ready; the launcher's own probe caught it
+        connect.assert_called_once()
+        popen.assert_not_called()
+        status,state=self.http.get("/status",ADMIN_HEADER)
+        self.assertEqual((status,state["status"]),(200,"error"))
+        self.assertIn("unreachable",state["error"])
+        self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)
+        self.assertEqual(self.http.get("/status",ADMIN_HEADER)[1]["status"],"stopped")
+
+    def test_tcp_only_listener_is_not_treated_as_a_worker(self):
+        nid=registry.register_node("Helper",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
+        import subprocess
+        not_llama=subprocess.CompletedProcess(args=[],returncode=0,stdout="Available devices:\n  CUDA0: fake GPU",stderr="")
+        with (mock.patch.object(self.launcher.socket,"create_connection"),   # port 50052 accepts TCP...
+              mock.patch.object(self.launcher.subprocess,"run",return_value=not_llama),   # ...but it is not llama.cpp RPC
+              mock.patch.object(self.launcher.subprocess,"Popen") as popen):
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[nid]},ADMIN_HEADER)
+        self.assertNotEqual(status,200,body)
+        popen.assert_not_called()
+        self.assertIn("not llama.cpp compatible",self.http.get("/status",ADMIN_HEADER)[1]["error"])
 
 
 if __name__=="__main__":
