@@ -35,9 +35,8 @@ class TestCoordinatorAPI(unittest.TestCase):
         response = self.client.post("/register", json={
             "node_name": "TestLaptop",
             "ram_gb": 16.0,
-            "rpc_port": 50051,
-            "admin_token": "test-admin-token"
-        })
+            "rpc_port": 50051
+        }, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"node_id": "node-123", "credentials": "cred-xyz"})
         # Note: address is now passed
@@ -51,9 +50,8 @@ class TestCoordinatorAPI(unittest.TestCase):
         response = self.client.post("/register", json={
             "node_name": "TestLaptop",
             "ram_gb": 16.0,
-            "rpc_port": 50051,
-            "admin_token": "wrong-token"
-        })
+            "rpc_port": 50051
+        }, headers={"Authorization": "Bearer wrong-token"})
         self.assertEqual(response.status_code, 403)
 
     @patch("coordinator.registry.update_heartbeat")
@@ -122,12 +120,12 @@ class TestCoordinatorAPI(unittest.TestCase):
     def test_create_invite_success(self, mock_create_invite):
         mock_create_invite.return_value = {"invite_code": "INV-123", "expires_at": "2026-12-31"}
         
-        response = self.client.post("/invite", json={"admin_token": "test-admin-token"})
+        response = self.client.post("/invite", json={}, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"invite_code": "INV-123", "expires_at": "2026-12-31"})
 
     def test_create_invite_unauthorized(self):
-        response = self.client.post("/invite", json={"admin_token": "wrong-token"})
+        response = self.client.post("/invite", json={}, headers={"Authorization": "Bearer wrong-token"})
         self.assertEqual(response.status_code, 403)
 
     @patch("coordinator.registry.register_node")
@@ -171,7 +169,7 @@ class TestCoordinatorAPI(unittest.TestCase):
         if old_token is not None:
             del os.environ["LOWLLAMA_ADMIN_TOKEN"]
         try:
-            response = self.client.post("/invite", json={"admin_token": "any"})
+            response = self.client.post("/invite", json={}, headers={"Authorization": "Bearer any"})
             self.assertEqual(response.status_code, 403)
             self.assertEqual(response.json()["detail"], "Admin access not configured")
         finally:
@@ -205,7 +203,7 @@ class TestCoordinatorAPI(unittest.TestCase):
         if old_ip is not None:
             del os.environ["LOWLLAMA_MASTER_IP"]
         try:
-            response = self.client.post("/invite", json={"admin_token": DEFAULT_ADMIN_TOKEN})
+            response = self.client.post("/invite", json={}, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 503)
             self.assertEqual(response.json()["detail"], "set LOWLLAMA_MASTER_IP")
         finally:
@@ -218,12 +216,13 @@ class TestCoordinatorAPI(unittest.TestCase):
         os.environ["LOWLLAMA_MASTER_IP"] = "100.64.0.1"
         mock_create_invite.side_effect = InviteError("Other error")
         try:
-            response = self.client.post("/invite", json={"admin_token": DEFAULT_ADMIN_TOKEN})
+            response = self.client.post("/invite", json={}, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 503)
             # detail will be str(e)
             self.assertEqual(response.json()["detail"], "Other error")
         finally:
-            del os.environ["LOWLLAMA_MASTER_IP"]
+            if "LOWLLAMA_MASTER_IP" in os.environ:
+                del os.environ["LOWLLAMA_MASTER_IP"]
 
     def test_model_start_invalid_model(self):
         response = self.client.post("/start", 
@@ -240,9 +239,13 @@ class TestCoordinatorAPI(unittest.TestCase):
         launcher_mock = MagicMock()
         launcher_mock.status.return_value = {"status": "ready", "model_id": "llama-3-8b"}
         with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
-            response = self.client.get("/status")
+            response = self.client.get("/status", headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["status"], "ready")
+
+    def test_model_status_unauthorized(self):
+        response = self.client.get("/status")
+        self.assertEqual(response.status_code, 401)
 
     def test_model_stop_success(self):
         launcher_mock = MagicMock()
@@ -254,7 +257,9 @@ class TestCoordinatorAPI(unittest.TestCase):
 
     def test_model_start_success(self):
         workers_mock = MagicMock()
-        workers_mock.get_candidates.return_value = [{"node_id": "n1", "address": "100.64.0.1", "port": 50052}]
+        selection_mock = MagicMock()
+        selection_mock.candidates = [MagicMock()]
+        workers_mock.get_candidates.return_value = selection_mock
         launcher_mock = MagicMock()
         launcher_mock.start.return_value = {"status": "starting", "model_id": "llama-3-8b"}
         
@@ -279,9 +284,15 @@ class TestCoordinatorAPI(unittest.TestCase):
         with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
             response = self.client.post("/chat", json={
                 "messages": [{"role": "user", "content": "Hi"}]
-            })
+            }, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["choices"][0]["message"]["content"], "Hello")
+
+    def test_chat_unauthorized(self):
+        response = self.client.post("/chat", json={
+            "messages": [{"role": "user", "content": "Hi"}]
+        })
+        self.assertEqual(response.status_code, 401)
 
     def test_chat_not_ready(self):
         launcher_mock = MagicMock()
@@ -290,9 +301,31 @@ class TestCoordinatorAPI(unittest.TestCase):
         with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
             response = self.client.post("/chat", json={
                 "messages": [{"role": "user", "content": "Hi"}]
-            })
+            }, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 503)
             self.assertIn("not ready", response.json()["detail"])
+
+    def test_model_start_qwen(self):
+        workers_mock = MagicMock()
+        selection_mock = MagicMock()
+        selection_mock.candidates = [MagicMock()]
+        workers_mock.get_candidates.return_value = selection_mock
+        launcher_mock = MagicMock()
+        launcher_mock.start.return_value = {"status": "starting", "model_id": "qwen2.5-7b"}
+        
+        with patch.dict("sys.modules", {"coordinator.workers": workers_mock, "coordinator.launcher": launcher_mock}):
+            response = self.client.post("/start", 
+                                        json={"model_id": "qwen2.5-7b", "node_ids": ["n1"]},
+                                        headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["model_id"], "qwen2.5-7b")
+
+    def test_model_start_empty_nodes(self):
+        response = self.client.post("/start", 
+                                    json={"model_id": "llama-3-8b", "node_ids": []},
+                                    headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Selection must not be empty")
 
 if __name__ == '__main__':
     unittest.main()

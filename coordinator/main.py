@@ -11,10 +11,9 @@ app = FastAPI(title="LowLlama Coordinator")
 # --- Schemas ---
 
 class RegistrationRequest(BaseModel):
-    node_name: str = Field(..., min_length=1, max_length=64, json_schema_extra={"examples": ["MyLaptop"]})
-    ram_gb: float = Field(..., gt=0, json_schema_extra={"examples": [16.0]})
-    rpc_port: int = Field(..., ge=1, le=65535, json_schema_extra={"examples": [50051]})
-    admin_token: str
+    node_name: str = Field(..., min_length=1, max_length=64)
+    ram_gb: float = Field(..., gt=0)
+    rpc_port: int = Field(..., ge=1, le=65535)
 
 class RegistrationResponse(BaseModel):
     node_id: str
@@ -45,7 +44,7 @@ class NodeInfo(BaseModel):
     last_seen_s: Optional[float] = None
 
 class InviteCreateRequest(BaseModel):
-    admin_token: str
+    pass
 
 class InviteCreateResponse(BaseModel):
     invite_code: str
@@ -82,6 +81,7 @@ class ChatRequest(BaseModel):
 security = HTTPBearer()
 
 ALLOWED_MODELS = {
+    "qwen2.5-7b": "models/qwen2.5-7b-instruct.Q4_K_M.gguf",
     "llama-3-8b": "models/llama-3-8b-instruct.Q4_K_M.gguf",
     "phi-3-mini": "models/phi-3-mini-4k-instruct.Q4_K_M.gguf"
 }
@@ -109,8 +109,8 @@ async def health():
     return {"status": "healthy"}
 
 @app.post("/register", response_model=RegistrationResponse)
-async def register(request: RegistrationRequest, req: Request):
-    verify_admin(request.admin_token)
+async def register(request: RegistrationRequest, req: Request, _admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     from coordinator import registry
     try:
         result = registry.register_node(
@@ -144,20 +144,20 @@ async def heartbeat(request: HeartbeatRequest):
     except HTTPException:
         raise
     except Exception as e:
-        if e.__class__.__name__ == "InvalidNodeData":
+        if isinstance(e, registry.InvalidNodeData):
             raise HTTPException(status_code=422, detail=str(e))
         raise HTTPException(status_code=500, detail="Internal server error during heartbeat")
 
 @app.get("/nodes", response_model=List[NodeInfo])
 async def get_nodes(_admin_token: str = Depends(get_admin)):
+    verify_admin(_admin_token)
     from coordinator import registry
     nodes = registry.get_all_nodes()
     return nodes
 
 @app.post("/invite", response_model=InviteCreateResponse)
-async def create_invite(request: InviteCreateRequest):
-    verify_admin(request.admin_token)
-    
+async def create_invite(request: InviteCreateRequest, _admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     if not os.environ.get("LOWLLAMA_MASTER_IP"):
         raise HTTPException(status_code=503, detail="set LOWLLAMA_MASTER_IP")
     
@@ -181,30 +181,20 @@ async def join(request: JoinRequest, req: Request):
         raise HTTPException(status_code=400, detail=str(e))
         
     try:
-        # Proposed register_node should support client_id
-        try:
-            result = registry.register_node(
-                name=request.node_name,
-                ram=request.ram_gb,
-                port=request.rpc_port,
-                address=req.client.host if req.client else None,
-                client_id=request.client_id
-            )
-        except TypeError:
-            # Fallback for old registry version
-            result = registry.register_node(
-                name=request.node_name,
-                ram=request.ram_gb,
-                port=request.rpc_port,
-                address=req.client.host if req.client else None
-            )
+        result = registry.register_node(
+            name=request.node_name,
+            ram=request.ram_gb,
+            port=request.rpc_port,
+            address=req.client.host if req.client else None,
+            client_id=request.client_id
+        )
         return result
     except HTTPException:
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        if e.__class__.__name__ == "NodeConflictError":
+        if isinstance(e, registry.NodeConflictError):
             raise HTTPException(status_code=409, detail=str(e))
         raise HTTPException(status_code=500, detail="Internal server error during join")
 
@@ -225,14 +215,18 @@ async def reconnect(request: ReconnectRequest):
     except HTTPException:
         raise
     except Exception as e:
-        if e.__class__.__name__ == "NodeAuthError":
+        if isinstance(e, registry.NodeAuthError):
             raise HTTPException(status_code=401, detail=str(e))
         raise HTTPException(status_code=500, detail="Internal server error during reconnect")
 
 @app.post("/start", response_model=ModelStatusResponse)
 async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     if request.model_id not in ALLOWED_MODELS:
         raise HTTPException(status_code=400, detail=f"Model {request.model_id} not in allowlist")
+
+    if not request.node_ids:
+        raise HTTPException(status_code=400, detail="Selection must not be empty")
 
     try:
         from coordinator import workers
@@ -242,30 +236,36 @@ async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admi
 
     # 1. Get candidate nodes for distributed inference
     try:
-        candidates = workers.get_candidates(request.node_ids)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error selecting workers: {str(e)}")
+        selection = workers.get_candidates(request.node_ids)
+        if not selection.candidates:
+            raise HTTPException(status_code=400, detail="No usable workers found in selection")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error selecting workers")
 
     # 2. Call launcher to start the model
     try:
-        result = launcher.start(request.model_id, candidates)
+        result = launcher.start(request.model_id, selection)
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Launcher error")
 
 @app.get("/status", response_model=ModelStatusResponse)
-async def get_model_status():
+async def get_model_status(_admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     try:
         from coordinator import launcher
         return launcher.status()
     except ImportError:
         # If not implemented, return stopped
         return {"status": "stopped", "error": "Launcher module missing"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    except Exception:
+        return {"status": "error", "error": "Status check failed"}
 
 @app.post("/stop", response_model=ModelStopResponse)
 async def stop_model(_admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     try:
         from coordinator import launcher
         launcher.stop()
@@ -276,7 +276,8 @@ async def stop_model(_admin: str = Depends(get_admin)):
         raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
+    verify_admin(_admin)
     try:
         from coordinator import launcher
         state = launcher.status()

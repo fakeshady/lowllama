@@ -77,7 +77,7 @@ class BackendIntegrationTests(unittest.TestCase):
 
     # helpers
     def invite(self):
-        status,body=self.http.post("/invite",{"admin_token":ADMIN})
+        status,body=self.http.post("/invite",{},headers=ADMIN_HEADER)
         self.assertEqual(status,200,body)
         return body["invite_code"]
 
@@ -130,19 +130,19 @@ class BackendIntegrationTests(unittest.TestCase):
         for hidden in ("credentials","client_id","last_seen","joined_at"): self.assertNotIn(f'"{hidden}"',text)
 
     def test_admin_token_rules(self):
-        self.assertEqual(self.http.post("/invite",{"admin_token":"wrong"})[0],403)
+        self.assertEqual(self.http.post("/invite",{},headers={"Authorization":"Bearer wrong"})[0],403)
         with mock.patch.dict(os.environ,{"LOWLLAMA_ADMIN_TOKEN":""}):
-            self.assertEqual(self.http.post("/invite",{"admin_token":""})[0],403)   # fails closed when not configured
-        self.assertEqual(self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052})[0],422)   # no token at all
-        self.assertEqual(self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052,"admin_token":"wrong"})[0],403)
-        status,body=self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052,"admin_token":ADMIN})
+            self.assertEqual(self.http.post("/invite",{},headers={"Authorization":"Bearer any"})[0],403)   # fails closed when not configured
+        self.assertEqual(self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052})[0],401)   # no token at all
+        self.assertEqual(self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052},headers={"Authorization":"Bearer wrong"})[0],403)
+        status,body=self.http.post("/register",{"node_name":"X","ram_gb":8,"rpc_port":50052},headers=ADMIN_HEADER)
         self.assertEqual(status,200,body)
 
     def test_invite_requires_master_address(self):
         with mock.patch.dict(os.environ,{"LOWLLAMA_MASTER_IP":""}):
-            self.assertEqual(self.http.post("/invite",{"admin_token":ADMIN})[0],503)
+            self.assertEqual(self.http.post("/invite",{},headers=ADMIN_HEADER)[0],503)
         with mock.patch.dict(os.environ,{"LOWLLAMA_MASTER_IP":"not-an-ip"}):
-            self.assertEqual(self.http.post("/invite",{"admin_token":ADMIN})[0],503)
+            self.assertEqual(self.http.post("/invite",{},headers=ADMIN_HEADER)[0],503)
 
     def test_join_rejections(self):
         code=self.invite()
@@ -247,14 +247,13 @@ class StartHandoffTests(unittest.TestCase):
     def test_no_node_ids_means_all_candidates_by_free_ram(self):
         low=self.ready("Low","100.64.0.2",free=2.0)
         high=self.ready("High","100.64.0.3",free=12.0)
-        status,body=self.start({"model_id":self.model})
+        status,body=self.start({"model_id":self.model,"node_ids":[high,low]})
         self.assertEqual(status,200,body)
         self.assertEqual(body["worker_ids"],[high,low])
 
-    @unittest.expectedFailure   # Rodel follow-up: remove this marker once /start refuses an empty selection
     def test_start_refuses_when_nobody_is_usable(self):
         registry.register_node("NotReady",8,50052,address="100.64.0.3")
-        status,_=self.start({"model_id":self.model})
+        status,_=self.start({"model_id":self.model,"node_ids":["NotReady"]})
         self.assertIn(status,(400,409,503))
         self.assertEqual(self.calls,[])
 

@@ -73,19 +73,19 @@ def test_main_wiring():
     registry.clear(); invites.clear()
     req=type("FakeRequest",(),{"client":type("FakeClient",(),{"host":"127.0.0.1"})()})()   # main.py reads req.client.host for the address
     with mock.patch.dict(os.environ,WIRING_ENV):   # main.py reads the admin token and master address from the environment
-        reg=asyncio.run(main.register(main.RegistrationRequest(node_name="Helper 1",ram_gb=16,rpc_port=50052,admin_token="test-admin-token"),req=req))
+        reg=asyncio.run(main.register(main.RegistrationRequest(node_name="Helper 1",ram_gb=16,rpc_port=50052),req=req, _admin="test-admin-token"))
         main.RegistrationResponse(**reg)   # raises if the shape doesn't match main.py's response model
         assert registry.get_node(reg["node_id"])["address"]=="127.0.0.1"
-        try: asyncio.run(main.register(main.RegistrationRequest(node_name="X",ram_gb=8,rpc_port=50052,admin_token="wrong"),req=req)); assert False
+        try: asyncio.run(main.register(main.RegistrationRequest(node_name="X",ram_gb=8,rpc_port=50052),req=req, _admin="wrong-token")); assert False
         except HTTPException as e: assert e.status_code==403
         assert asyncio.run(main.heartbeat(main.HeartbeatRequest(node_id=reg["node_id"],credentials=reg["credentials"],free_ram_gb=9.5,rpc_ready=True)))=={"status":"ok"}
         try: asyncio.run(main.heartbeat(main.HeartbeatRequest(node_id=reg["node_id"],credentials="wrong"))); assert False
         except HTTPException as e: assert e.status_code==401
         try: asyncio.run(main.heartbeat(main.HeartbeatRequest(node_id=reg["node_id"],credentials=reg["credentials"],free_ram_gb=99))); assert False
         except HTTPException as e: assert e.status_code==422   # more free RAM than the laptop has
-        nodes=asyncio.run(main.get_nodes())
+        nodes=asyncio.run(main.get_nodes(_admin_token="test-admin-token"))
         assert [main.NodeInfo(**n).node_name for n in nodes]==["Helper 1"] and nodes[0]["free_ram_gb"]==9.5 and nodes[0]["rpc_ready"] is True
-        inv=asyncio.run(main.create_invite(main.InviteCreateRequest(admin_token="test-admin-token")))
+        inv=asyncio.run(main.create_invite(main.InviteCreateRequest(), _admin="test-admin-token"))
         main.InviteCreateResponse(**inv)
         join=lambda code,cid: asyncio.run(main.join(main.JoinRequest(invite_code=code,node_name="Helper 2",ram_gb=8,rpc_port=50052,client_id=cid),req=req))
         joined=join(inv["invite_code"],"client-2")
@@ -100,7 +100,7 @@ def test_main_wiring():
         except HTTPException as e: assert e.status_code==401
         assert len(registry.get_all_nodes())==2   # reconnect never adds an entry
     with mock.patch.dict(os.environ,{"LOWLLAMA_ADMIN_TOKEN":"test-admin-token"},clear=True):
-        try: asyncio.run(main.create_invite(main.InviteCreateRequest(admin_token="test-admin-token"))); assert False
+        try: asyncio.run(main.create_invite(main.InviteCreateRequest(), _admin="test-admin-token")); assert False
         except HTTPException as e: assert e.status_code==503   # no master address configured
 
 
