@@ -240,6 +240,19 @@ does not have usable credentials for it. Restore the protected agent state, or
 ask the coordinator administrator to remove the old registry entry before
 using a new invite. The client intentionally does not bypass this protection.
 
+### The coordinator restarted
+
+The current coordinator registry and invitation store are in memory. A
+coordinator restart therefore forgets previously issued node credentials and
+cancels active invites. On its next `/reconnect`, the helper receives an
+authentication rejection, removes the now-useless local registration, and asks
+for a new invite. Generate a fresh invite and restart the helper with
+`LOWLLAMA_INVITE_CODE` set. This creates a new server-issued node identity.
+
+This differs from restarting only the helper: when the coordinator stayed up,
+the protected credential remains valid and `/reconnect` reuses the same node ID
+without adding another registry entry.
+
 ### RPC is unreachable from the master
 
 RPC uses port `50052`, while the coordinator normally uses port `8000`. Confirm
@@ -285,7 +298,7 @@ Each file can also run directly:
 .\.venv\Scripts\python.exe .\agent\tests\test_agent.py -v
 ```
 
-The Phase 1 suite currently contains 70 agent tests.
+The Phase 1 suite currently contains 72 agent tests.
 
 ## Security considerations
 

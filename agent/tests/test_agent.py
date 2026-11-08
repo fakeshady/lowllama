@@ -302,6 +302,75 @@ class HelperAgentTests(unittest.TestCase):
         self.client.send_heartbeat.assert_called_once()
         self.assertEqual(waits, [3.0, 10.0])
 
+    def test_coordinator_restart_without_invite_requires_reenrollment(self) -> None:
+        """Unknown stored credentials fail clearly after in-memory server reset."""
+
+        self.credential_store.load.return_value = StoredRegistration(
+            "https://coordinator.test:8000",
+            "forgotten-node",
+            "forgotten-credential",
+        )
+        self.client.reconnect.side_effect = CoordinatorAuthenticationError(
+            401, "unknown node"
+        )
+        agent = HelperAgent(
+            _config(invite_code=None),
+            _hardware(),  # type: ignore[arg-type]
+            self.client,
+            self.credential_store,
+            available_ram_probe=self.available_ram_probe,
+            rpc_probe=self.rpc_probe,
+            stop_event=self.stop_event,
+            wait=lambda _delay: False,
+            logger=self.logger,
+        )
+
+        with self.assertRaisesRegex(AgentStartupError, "new invite"):
+            agent.run()
+
+        self.credential_store.clear.assert_called_once_with()
+        self.client.join.assert_not_called()
+        self.client.send_heartbeat.assert_not_called()
+
+    def test_runtime_status_is_refreshed_for_every_heartbeat(self) -> None:
+        self.client.join.return_value = RegistrationResult(
+            "server-node", "secret-credential"
+        )
+        self.available_ram_probe.side_effect = [7.5, 6.25]
+        self.rpc_probe.side_effect = [True, False]
+        heartbeat_number = 0
+
+        def heartbeat_then_stop(*_args, **_kwargs) -> HeartbeatResult:
+            nonlocal heartbeat_number
+            heartbeat_number += 1
+            if heartbeat_number == 2:
+                self.stop_event.is_set.return_value = True
+            return HeartbeatResult("ok")
+
+        self.client.send_heartbeat.side_effect = heartbeat_then_stop
+
+        self._agent(lambda _delay: False).run()
+
+        self.assertEqual(
+            self.client.send_heartbeat.call_args_list,
+            [
+                unittest.mock.call(
+                    "server-node",
+                    "secret-credential",
+                    free_ram_gb=7.5,
+                    rpc_ready=True,
+                ),
+                unittest.mock.call(
+                    "server-node",
+                    "secret-credential",
+                    free_ram_gb=6.25,
+                    rpc_ready=False,
+                ),
+            ],
+        )
+        self.assertEqual(self.available_ram_probe.call_count, 2)
+        self.assertEqual(self.rpc_probe.call_count, 2)
+
     def test_runtime_probe_failures_report_safe_unknown_state(self) -> None:
         self.client.join.return_value = RegistrationResult(
             "server-node", "secret-credential"
