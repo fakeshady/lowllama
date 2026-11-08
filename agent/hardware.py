@@ -88,17 +88,27 @@ def _detect_memory() -> tuple[float | None, float | None]:
     except Exception:
         available = None
 
-    return _bytes_to_gib(total), _bytes_to_gib(available)
+    total_gib = _bytes_to_gib(total)
+    available_gib = _bytes_to_gib(available)
+    if total_gib is not None and available_gib is not None:
+        available_gib = min(available_gib, total_gib)
+    return total_gib, available_gib
 
 
 def get_available_ram_gb() -> float | None:
     """Return current available RAM in GiB, or ``None`` when unavailable."""
 
     try:
-        available = psutil.virtual_memory().available
+        memory = psutil.virtual_memory()
+        available = _bytes_to_gib(memory.available)
+        total = _bytes_to_gib(memory.total)
     except Exception:
         return None
-    return _bytes_to_gib(available)
+    if available is None:
+        return None
+    if total is not None:
+        return min(available, total)
+    return available
 
 
 def get_hardware_info() -> HardwareInfo:

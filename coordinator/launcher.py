@@ -11,6 +11,7 @@ import atexit
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -26,7 +27,10 @@ from typing import Any, TextIO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SERVER_BINARY = PROJECT_ROOT / ".runtime" / "llama-b12110-cuda" / "llama-server.exe"
+PINNED_SERVER_BINARY = (
+    PROJECT_ROOT / ".runtime" / "llama-b12110-cuda" / "llama-server.exe"
+)
+SERVER_BINARY = PINNED_SERVER_BINARY
 MODEL_ALLOWLIST = {
     "llama-3-8b": PROJECT_ROOT / "models" / "llama-3-8b-instruct.Q4_K_M.gguf",
     "phi-3-mini": PROJECT_ROOT / "models" / "phi-3-mini-4k-instruct.Q4_K_M.gguf",
@@ -42,6 +46,9 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
 RPC_CONNECT_TIMEOUT_SECONDS = 2.0
 RPC_COMPATIBILITY_TIMEOUT_SECONDS = 15.0
+MASTER_RUNTIME_TIMEOUT_SECONDS = 15.0
+PINNED_LLAMA_BUILD = 12110
+PINNED_LLAMA_COMMIT_PREFIX = "cd959bae9"
 STARTUP_TIMEOUT_SECONDS = 60.0
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
 STOP_TIMEOUT_SECONDS = 5.0
@@ -114,8 +121,13 @@ def start(model_id: str, selection: object) -> dict[str, Any]:
         binary, model = _resolve_runtime(model_id)
         endpoints = _selection_endpoints(selection)
         worker_ids = _selection_worker_ids(selection, len(endpoints))
+        using_pinned_runtime = binary == PINNED_SERVER_BINARY.resolve()
+        if using_pinned_runtime:
+            _probe_master_runtime(binary)
         for endpoint in endpoints:
             _probe_rpc_endpoint(endpoint, binary)
+        if using_pinned_runtime:
+            _probe_rpc_group(endpoints, binary)
         _ensure_server_port_available()
         command = _build_command(binary, model, model_id, endpoints)
         process = subprocess.Popen(
@@ -296,8 +308,74 @@ def _probe_rpc_endpoint(endpoint: str, binary: Path) -> None:
             f"RPC compatibility probe failed for {endpoint}"
         ) from exc
     output = f"{result.stdout}\n{result.stderr}"
-    if result.returncode != 0 or "RPC0:" not in output:
+    if result.returncode != 0 or not re.search(r"(?m)^\s*RPC0:", output):
         raise RpcEndpointError(f"RPC worker {endpoint} is not llama.cpp compatible")
+
+
+def _probe_master_runtime(binary: Path) -> None:
+    """Require the pinned llama.cpp build and CUDA0 before starting a child."""
+
+    version = _run_device_probe(binary, ["--version"], "master version")
+    if (
+        not re.search(rf"\bbuild\s+{PINNED_LLAMA_BUILD}\b", version, re.IGNORECASE)
+        or PINNED_LLAMA_COMMIT_PREFIX not in version.lower()
+    ):
+        raise LauncherConfigurationError(
+            f"Master llama.cpp runtime is not pinned build {PINNED_LLAMA_BUILD}"
+        )
+    devices = _run_device_probe(binary, ["--list-devices"], "master device")
+    if not re.search(r"(?m)^\s*CUDA0:", devices):
+        raise LauncherConfigurationError("Master CUDA0 device is unavailable")
+
+
+def _probe_rpc_group(endpoints: list[str], binary: Path) -> None:
+    """Verify a multiworker RPC list exposes every ordered RPC device."""
+
+    if len(endpoints) < 2:
+        return
+    output = _run_device_probe(
+        binary,
+        ["--rpc", ",".join(endpoints), "--list-devices"],
+        "combined RPC compatibility",
+        error_type=RpcEndpointError,
+    )
+    missing = [
+        f"RPC{index}"
+        for index in range(len(endpoints))
+        if not re.search(rf"(?m)^\s*RPC{index}:", output)
+    ]
+    if missing:
+        raise RpcEndpointError(
+            "Combined RPC compatibility probe did not expose " + ", ".join(missing)
+        )
+
+
+def _run_device_probe(
+    binary: Path,
+    arguments: list[str],
+    label: str,
+    *,
+    error_type: type[LauncherError] = LauncherConfigurationError,
+) -> str:
+    """Run one bounded, non-shell runtime probe and return sanitized output."""
+
+    try:
+        result = subprocess.run(
+            [str(binary), *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=MASTER_RUNTIME_TIMEOUT_SECONDS,
+            shell=False,
+            creationflags=_probe_creation_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise error_type(f"Pinned llama.cpp {label} probe failed") from exc
+    if result.returncode != 0:
+        raise error_type(f"Pinned llama.cpp {label} probe failed")
+    return f"{result.stdout}\n{result.stderr}"
 
 
 def _ensure_server_port_available() -> None:

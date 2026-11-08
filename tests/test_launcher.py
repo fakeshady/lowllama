@@ -70,8 +70,12 @@ class LauncherTests(unittest.TestCase):
         self.binary.write_bytes(b"binary")
         self.model.write_bytes(b"model")
         self.real_port_check = launcher._ensure_server_port_available  # kept for the one test that binds a real socket
+        self.real_master_probe = launcher._probe_master_runtime
+        self.real_group_probe = launcher._probe_rpc_group
         self.patches = [
             mock.patch.object(launcher, "_ensure_server_port_available"),  # never depend on 8080 being free on this laptop
+            mock.patch.object(launcher, "_probe_master_runtime"),
+            mock.patch.object(launcher, "_probe_rpc_group"),
             mock.patch.object(launcher, "SERVER_BINARY", self.binary),
             mock.patch.object(launcher, "MODEL_ALLOWLIST", {"test-model": self.model}),
             mock.patch.object(launcher, "HEALTH_POLL_INTERVAL_SECONDS", 0.001),
@@ -466,11 +470,60 @@ class LauncherTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertTrue(command[command.index("--device") + 1].startswith("CUDA0,"))
 
-    def test_master_without_cuda_fails_clearly_instead_of_hanging(self) -> None:
-        process, _ = self._start_ok(_Selection("100.64.0.2:50052"), health=False)
-        process.return_code = 1  # llama-server exits when CUDA0 does not exist
-        failed = self._wait_for_state("error")
-        self.assertRegex(failed["error"], r"exited (before readiness|unexpectedly) \(code 1\)")  # monitor or status() may notice first
+    def test_master_runtime_requires_pinned_build_and_cuda0(self) -> None:
+        version = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="version 0.9.0 (build 12110, commit cd959bae9)", stderr=""
+        )
+        devices = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Available devices:\n  CUDA0: RTX 4060", stderr=""
+        )
+        with mock.patch.object(launcher.subprocess, "run", side_effect=[version, devices]) as run:
+            self.real_master_probe(self.binary)
+        self.assertEqual(run.call_args_list[0].args[0], [str(self.binary), "--version"])
+        self.assertEqual(run.call_args_list[1].args[0], [str(self.binary), "--list-devices"])
+
+        wrong_build = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="version 0.9.0 (build 12000)", stderr=""
+        )
+        with mock.patch.object(launcher.subprocess, "run", return_value=wrong_build):
+            with self.assertRaisesRegex(launcher.LauncherConfigurationError, "pinned build 12110"):
+                self.real_master_probe(self.binary)
+
+    def test_missing_cuda_fails_before_worker_probe_or_popen(self) -> None:
+        selection = _Selection("100.64.0.2:50052")
+        with (
+            mock.patch.object(
+                launcher,
+                "_probe_master_runtime",
+                side_effect=launcher.LauncherConfigurationError("Master CUDA0 device is unavailable"),
+            ),
+            mock.patch.object(launcher, "PINNED_SERVER_BINARY", self.binary),
+            mock.patch.object(launcher, "_probe_rpc_endpoint") as rpc_probe,
+            mock.patch.object(launcher.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(launcher.LauncherConfigurationError, "CUDA0"):
+                launcher.start("test-model", selection)
+        rpc_probe.assert_not_called()
+        popen.assert_not_called()
+
+    def test_combined_rpc_probe_requires_every_ordered_device(self) -> None:
+        endpoints = ["100.64.0.9:50052", "100.64.0.2:50052"]
+        complete = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="RPC0: first\nRPC1: second", stderr=""
+        )
+        with mock.patch.object(launcher.subprocess, "run", return_value=complete) as run:
+            self.real_group_probe(endpoints, self.binary)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(self.binary), "--rpc", ",".join(endpoints), "--list-devices"],
+        )
+
+        incomplete = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="RPC0: first", stderr=""
+        )
+        with mock.patch.object(launcher.subprocess, "run", return_value=incomplete):
+            with self.assertRaisesRegex(launcher.RpcEndpointError, "RPC1"):
+                self.real_group_probe(endpoints, self.binary)
 
     def test_startup_timeout_terminates_child_and_reports_error(self) -> None:
         process, _ = self._start_ok(_Selection("100.64.0.2:50052"), health=False)
@@ -557,9 +610,29 @@ class LauncherTests(unittest.TestCase):
     def test_output_is_drained_into_bounded_diagnostics(self) -> None:
         process = _FakeProcess()
         process.stdout = io.StringIO("".join(f"line {i}\n" for i in range(launcher.MAX_DIAGNOSTIC_LINES + 50)))
-        launcher._drain_output(process)
+        log_directory = Path(self.temp.name) / "logs"
+        with mock.patch.object(launcher, "LAUNCH_LOG_DIRECTORY", log_directory):
+            launcher._drain_output(process)
         self.assertEqual(len(launcher._diagnostics), launcher.MAX_DIAGNOSTIC_LINES)
         self.assertEqual(launcher._diagnostics[-1], f"line {launcher.MAX_DIAGNOSTIC_LINES + 49}")
+        self.assertTrue(process.stdout.closed)
+        logs = list(log_directory.glob("api-launcher-*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(len(logs[0].read_text(encoding="utf-8").splitlines()), launcher.MAX_DIAGNOSTIC_LINES + 50)
+
+    def test_log_write_failure_does_not_stop_output_drain(self) -> None:
+        class BrokenLog:
+            def write(self, _line):
+                raise OSError("disk unavailable")
+
+            def close(self):
+                return None
+
+        process = _FakeProcess()
+        process.stdout = io.StringIO("first\nsecond\n")
+        with mock.patch.object(launcher, "_open_launch_log", return_value=BrokenLog()):
+            launcher._drain_output(process)
+        self.assertEqual(list(launcher._diagnostics)[-2:], ["first", "second"])
         self.assertTrue(process.stdout.closed)
 
     def test_health_check_requires_ok_json(self) -> None:

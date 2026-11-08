@@ -117,11 +117,27 @@ class GetHardwareInfoTests(unittest.TestCase):
 
     @patch("agent.hardware.psutil.virtual_memory")
     def test_available_ram_probe_is_dynamic_and_safe(self, virtual_memory) -> None:
-        virtual_memory.return_value.available = 5 * 1024**3
+        virtual_memory.return_value = SimpleNamespace(
+            total=16 * 1024**3,
+            available=5 * 1024**3,
+        )
         self.assertEqual(get_available_ram_gb(), 5.0)
 
         virtual_memory.side_effect = OSError("unavailable")
         self.assertIsNone(get_available_ram_gb())
+
+    @patch("agent.hardware.psutil.virtual_memory")
+    def test_available_ram_never_exceeds_total_ram(self, virtual_memory) -> None:
+        virtual_memory.return_value = SimpleNamespace(
+            total=4 * 1024**3,
+            available=8 * 1024**3,
+        )
+
+        result = get_hardware_info()
+
+        self.assertEqual(result["total_ram_gb"], 4.0)
+        self.assertEqual(result["available_ram_gb"], 4.0)
+        self.assertEqual(get_available_ram_gb(), 4.0)
 
 
 if __name__ == "__main__":
