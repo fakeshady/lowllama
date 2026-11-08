@@ -4,6 +4,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 import uvicorn
 
 app = FastAPI(title="LowLlama Coordinator")
@@ -80,11 +81,12 @@ class ChatRequest(BaseModel):
 
 security = HTTPBearer()
 
-ALLOWED_MODELS = {
-    "qwen2.5-7b": "models/qwen2.5-7b-instruct.Q4_K_M.gguf",
-    "llama-3-8b": "models/llama-3-8b-instruct.Q4_K_M.gguf",
-    "phi-3-mini": "models/phi-3-mini-4k-instruct.Q4_K_M.gguf"
-}
+def get_model_allowlist():
+    try:
+        from coordinator import launcher
+        return launcher.MODEL_ALLOWLIST
+    except ImportError:
+        return {}
 
 def verify_admin(token: str):
     admin_secret = os.environ.get("LOWLLAMA_ADMIN_TOKEN")
@@ -222,7 +224,9 @@ async def reconnect(request: ReconnectRequest):
 @app.post("/start", response_model=ModelStatusResponse)
 async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admin)):
     verify_admin(_admin)
-    if request.model_id not in ALLOWED_MODELS:
+    
+    allowlist = get_model_allowlist()
+    if request.model_id not in allowlist:
         raise HTTPException(status_code=400, detail=f"Model {request.model_id} not in allowlist")
 
     if not request.node_ids:
@@ -238,18 +242,28 @@ async def start_model(request: ModelStartRequest, _admin: str = Depends(get_admi
     try:
         selection = workers.get_candidates(request.node_ids)
         if not selection.candidates:
+            # Check if any were rejected
+            if getattr(selection, 'rejected', None):
+                reasons = ", ".join([f"{nid}: {err}" for nid, err in selection.rejected.items()])
+                raise HTTPException(status_code=400, detail=f"No usable workers. Rejected: {reasons}")
             raise HTTPException(status_code=400, detail="No usable workers found in selection")
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(status_code=500, detail="Error selecting workers")
+    except Exception as e:
+        # Check if it looks like a registry or selection error that should be 400
+        # If it's a generic Exception from workers.get_candidates it might be bad data
+        raise HTTPException(status_code=400, detail=f"Error selecting workers: {str(e)}")
 
-    # 2. Call launcher to start the model
+    # 2. Call launcher to start the model (offloaded to threadpool)
     try:
-        result = launcher.start(request.model_id, selection)
+        result = await run_in_threadpool(launcher.start, request.model_id, selection)
         return result
-    except Exception:
-        raise HTTPException(status_code=500, detail="Launcher error")
+    except launcher.LauncherBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except (launcher.LauncherConfigurationError, launcher.LauncherSelectionError, launcher.RpcEndpointError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Launcher error: {str(e)}")
 
 @app.get("/status", response_model=ModelStatusResponse)
 async def get_model_status(_admin: str = Depends(get_admin)):
@@ -258,17 +272,16 @@ async def get_model_status(_admin: str = Depends(get_admin)):
         from coordinator import launcher
         return launcher.status()
     except ImportError:
-        # If not implemented, return stopped
         return {"status": "stopped", "error": "Launcher module missing"}
-    except Exception:
-        return {"status": "error", "error": "Status check failed"}
+    except Exception as e:
+        return {"status": "error", "error": f"Status check failed: {str(e)}"}
 
 @app.post("/stop", response_model=ModelStopResponse)
 async def stop_model(_admin: str = Depends(get_admin)):
     verify_admin(_admin)
     try:
         from coordinator import launcher
-        launcher.stop()
+        await run_in_threadpool(launcher.stop)
         return {"status": "stopped"}
     except ImportError:
         raise HTTPException(status_code=501, detail="Launcher module missing")
@@ -278,11 +291,16 @@ async def stop_model(_admin: str = Depends(get_admin)):
 @app.post("/chat")
 async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
     verify_admin(_admin)
+    
+    if request.stream:
+        raise HTTPException(status_code=400, detail="Streaming not supported in MVP")
+
     try:
         from coordinator import launcher
         state = launcher.status()
         if state.get("status") != "ready":
-            raise HTTPException(status_code=503, detail="Model not ready")
+            status_msg = state.get("status", "unknown")
+            raise HTTPException(status_code=503, detail=f"Model not ready (status: {status_msg})")
     except ImportError:
         raise HTTPException(status_code=501, detail="Launcher module missing")
     except HTTPException:
@@ -293,13 +311,19 @@ async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
     import httpx
     try:
         async with httpx.AsyncClient() as client:
+            # Pinned to 127.0.0.1:8080 as per launcher.SERVER_PORT
+            payload = request.model_dump()
+            # Explicitly set model to current active model or a known alias if needed
+            # For now, llama-server usually accepts what it's given or ignores it
+            
             response = await client.post(
                 "http://127.0.0.1:8080/v1/chat/completions",
-                json=request.model_dump(),
+                json=payload,
                 timeout=120.0
             )
             if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
+                # Sanitize error to avoid leaking internal details but keep status
+                raise HTTPException(status_code=response.status_code, detail="Inference server error")
             return response.json()
     except httpx.RequestError:
         raise HTTPException(status_code=503, detail="Inference server unreachable")

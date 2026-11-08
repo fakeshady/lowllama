@@ -238,7 +238,7 @@ class TestCoordinatorAPI(unittest.TestCase):
     def test_model_status_success(self):
         launcher_mock = MagicMock()
         launcher_mock.status.return_value = {"status": "ready", "model_id": "llama-3-8b"}
-        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+        with patch("coordinator.launcher.status", launcher_mock.status):
             response = self.client.get("/status", headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["status"], "ready")
@@ -249,12 +249,13 @@ class TestCoordinatorAPI(unittest.TestCase):
 
     def test_model_stop_success(self):
         launcher_mock = MagicMock()
-        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+        with patch("coordinator.launcher.stop", launcher_mock.stop):
             response = self.client.post("/stop", headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["status"], "stopped")
             launcher_mock.stop.assert_called_once()
 
+    @patch("coordinator.launcher.MODEL_ALLOWLIST", {"llama-3-8b": "path", "qwen2.5-7b": "path"})
     def test_model_start_success(self):
         workers_mock = MagicMock()
         selection_mock = MagicMock()
@@ -263,12 +264,13 @@ class TestCoordinatorAPI(unittest.TestCase):
         launcher_mock = MagicMock()
         launcher_mock.start.return_value = {"status": "starting", "model_id": "llama-3-8b"}
         
-        with patch.dict("sys.modules", {"coordinator.workers": workers_mock, "coordinator.launcher": launcher_mock}):
-            response = self.client.post("/start", 
-                                        json={"model_id": "llama-3-8b", "node_ids": ["n1"]},
-                                        headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["status"], "starting")
+        with patch("coordinator.workers.get_candidates", workers_mock.get_candidates):
+            with patch("coordinator.launcher.start", launcher_mock.start):
+                response = self.client.post("/start", 
+                                            json={"model_id": "llama-3-8b", "node_ids": ["n1"]},
+                                            headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "starting")
 
     @patch("httpx.AsyncClient.post")
     def test_chat_success(self, mock_post):
@@ -281,7 +283,7 @@ class TestCoordinatorAPI(unittest.TestCase):
         mock_response.json.return_value = {"choices": [{"message": {"content": "Hello"}}]}
         mock_post.return_value = mock_response
         
-        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+        with patch("coordinator.launcher.status", launcher_mock.status):
             response = self.client.post("/chat", json={
                 "messages": [{"role": "user", "content": "Hi"}]
             }, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
@@ -298,13 +300,14 @@ class TestCoordinatorAPI(unittest.TestCase):
         launcher_mock = MagicMock()
         launcher_mock.status.return_value = {"status": "starting"}
         
-        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+        with patch("coordinator.launcher.status", launcher_mock.status):
             response = self.client.post("/chat", json={
                 "messages": [{"role": "user", "content": "Hi"}]
             }, headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
             self.assertEqual(response.status_code, 503)
             self.assertIn("not ready", response.json()["detail"])
 
+    @patch("coordinator.launcher.MODEL_ALLOWLIST", {"qwen2.5-7b": "path"})
     def test_model_start_qwen(self):
         workers_mock = MagicMock()
         selection_mock = MagicMock()
@@ -313,13 +316,15 @@ class TestCoordinatorAPI(unittest.TestCase):
         launcher_mock = MagicMock()
         launcher_mock.start.return_value = {"status": "starting", "model_id": "qwen2.5-7b"}
         
-        with patch.dict("sys.modules", {"coordinator.workers": workers_mock, "coordinator.launcher": launcher_mock}):
-            response = self.client.post("/start", 
-                                        json={"model_id": "qwen2.5-7b", "node_ids": ["n1"]},
-                                        headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["model_id"], "qwen2.5-7b")
+        with patch("coordinator.workers.get_candidates", workers_mock.get_candidates):
+            with patch("coordinator.launcher.start", launcher_mock.start):
+                response = self.client.post("/start", 
+                                            json={"model_id": "qwen2.5-7b", "node_ids": ["n1"]},
+                                            headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["model_id"], "qwen2.5-7b")
 
+    @patch("coordinator.launcher.MODEL_ALLOWLIST", {"llama-3-8b": "path"})
     def test_model_start_empty_nodes(self):
         response = self.client.post("/start", 
                                     json={"model_id": "llama-3-8b", "node_ids": []},

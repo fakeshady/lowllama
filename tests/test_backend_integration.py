@@ -225,11 +225,16 @@ class StartHandoffTests(unittest.TestCase):
             from coordinator import launcher as real_launcher   # Itmam's real module: replace its functions only,
             for name,fn in stand_ins.items():                   # so this works no matter which test imported it first
                 p=mock.patch.object(real_launcher,name,fn); p.start(); self.addCleanup(p.stop)
+            # Rodel: sync with real allowlist
+            self.model = next(iter(real_launcher.MODEL_ALLOWLIST))
+            p_models = mock.patch("coordinator.launcher.MODEL_ALLOWLIST", real_launcher.MODEL_ALLOWLIST)
+            p_models.start(); self.addCleanup(p_models.stop)
         except ImportError:   # older checkout without launcher.py: inject a whole stand-in module
             fake=types.ModuleType("coordinator.launcher")
+            fake.MODEL_ALLOWLIST = {"llama-3-8b": "path"}
             for name,fn in stand_ins.items(): setattr(fake,name,fn)
             mods=mock.patch.dict(sys.modules,{"coordinator.launcher":fake}); mods.start(); self.addCleanup(mods.stop)
-        self.model=next(iter(main.ALLOWED_MODELS))
+            self.model = "llama-3-8b"
 
     def ready(self, name, address, free=8.0):
         a=registry.register_node(name,16,50052,address=address,free_ram_gb=free,rpc_ready=True)
