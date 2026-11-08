@@ -103,9 +103,20 @@ class TestCoordinatorAPI(unittest.TestCase):
         ]
         mock_get_all_nodes.return_value = nodes_data
         
-        response = self.client.get("/nodes")
+        with patch.dict(os.environ, {"LOWLLAMA_ADMIN_TOKEN": "test-token"}):
+            response = self.client.get("/nodes", headers={"Authorization": "Bearer test-token"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), nodes_data)
+
+    def test_get_nodes_unauthorized(self):
+        with patch.dict(os.environ, {"LOWLLAMA_ADMIN_TOKEN": "test-token"}):
+            # No header -> 401 with HTTPBearer
+            response = self.client.get("/nodes")
+            self.assertEqual(response.status_code, 401)
+            
+            # Wrong token -> 403 (raised by verify_admin)
+            response = self.client.get("/nodes", headers={"Authorization": "Bearer wrong-token"})
+            self.assertEqual(response.status_code, 403)
 
     @patch("coordinator.invites.create_invite")
     def test_create_invite_success(self, mock_create_invite):
@@ -213,6 +224,75 @@ class TestCoordinatorAPI(unittest.TestCase):
             self.assertEqual(response.json()["detail"], "Other error")
         finally:
             del os.environ["LOWLLAMA_MASTER_IP"]
+
+    def test_model_start_invalid_model(self):
+        response = self.client.post("/start", 
+                                    json={"model_id": "invalid-model"}, 
+                                    headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not in allowlist", response.json()["detail"])
+
+    def test_model_start_unauthorized(self):
+        response = self.client.post("/start", json={"model_id": "llama-3-8b"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_model_status_success(self):
+        launcher_mock = MagicMock()
+        launcher_mock.status.return_value = {"status": "ready", "model_id": "llama-3-8b"}
+        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+            response = self.client.get("/status")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "ready")
+
+    def test_model_stop_success(self):
+        launcher_mock = MagicMock()
+        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+            response = self.client.post("/stop", headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "stopped")
+            launcher_mock.stop.assert_called_once()
+
+    def test_model_start_success(self):
+        workers_mock = MagicMock()
+        workers_mock.get_candidates.return_value = [{"node_id": "n1", "address": "100.64.0.1", "port": 50052}]
+        launcher_mock = MagicMock()
+        launcher_mock.start.return_value = {"status": "starting", "model_id": "llama-3-8b"}
+        
+        with patch.dict("sys.modules", {"coordinator.workers": workers_mock, "coordinator.launcher": launcher_mock}):
+            response = self.client.post("/start", 
+                                        json={"model_id": "llama-3-8b", "node_ids": ["n1"]},
+                                        headers={"Authorization": f"Bearer {DEFAULT_ADMIN_TOKEN}"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "starting")
+
+    @patch("httpx.AsyncClient.post")
+    def test_chat_success(self, mock_post):
+        launcher_mock = MagicMock()
+        launcher_mock.status.return_value = {"status": "ready"}
+        
+        # Mock httpx response
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": [{"message": {"content": "Hello"}}]}
+        mock_post.return_value = mock_response
+        
+        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+            response = self.client.post("/chat", json={
+                "messages": [{"role": "user", "content": "Hi"}]
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["choices"][0]["message"]["content"], "Hello")
+
+    def test_chat_not_ready(self):
+        launcher_mock = MagicMock()
+        launcher_mock.status.return_value = {"status": "starting"}
+        
+        with patch.dict("sys.modules", {"coordinator.launcher": launcher_mock}):
+            response = self.client.post("/chat", json={
+                "messages": [{"role": "user", "content": "Hi"}]
+            })
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("not ready", response.json()["detail"])
 
 if __name__ == '__main__':
     unittest.main()

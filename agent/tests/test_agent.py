@@ -95,9 +95,7 @@ class HelperAgentTests(unittest.TestCase):
         self.client.join.return_value = registration
 
         def heartbeat_then_stop(
-            node_id: str,
-            credentials: str,
-            **_status: object,
+            node_id: str, credentials: str, **_kwargs
         ) -> HeartbeatResult:
             self.stop_event.is_set.return_value = True
             return HeartbeatResult("ok")

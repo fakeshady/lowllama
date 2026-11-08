@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 psutil
-httpx2
+httpx
