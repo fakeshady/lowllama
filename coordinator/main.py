@@ -72,7 +72,7 @@ class ModelStopResponse(BaseModel):
     status: str
 
 class ChatRequest(BaseModel):
-    messages: List[dict]
+    messages: List[dict] = Field(..., min_length=1)
     max_tokens: Optional[int] = Field(512, gt=0, le=4096)
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     stream: Optional[bool] = False
@@ -119,12 +119,15 @@ async def register(request: RegistrationRequest, req: Request, _admin: str = Dep
             name=request.node_name,
             ram=request.ram_gb,
             port=request.rpc_port,
-            address=req.client.host if req.client else None
+            address=req.client.host if req.client else None,
+            client_id=None
         )
         return result
-    except ValueError as e:
+    except registry.InvalidNodeData as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
+    except registry.NodeConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
         raise HTTPException(status_code=500, detail="Internal server error during registration")
 
 @app.post("/heartbeat", response_model=HeartbeatResponse)
@@ -193,32 +196,27 @@ async def join(request: JoinRequest, req: Request):
         return result
     except HTTPException:
         raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        if isinstance(e, registry.NodeConflictError):
-            raise HTTPException(status_code=409, detail=str(e))
+    except registry.InvalidNodeData as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except registry.NodeConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error during join")
 
 @app.post("/reconnect", response_model=HeartbeatResponse)
 async def reconnect(request: ReconnectRequest):
     from coordinator import registry
     try:
-        # Proposed reconnect_node should check node_id and credentials
-        success = registry.reconnect_node(
+        registry.reconnect_node(
             node_id=request.node_id,
             credentials=request.credentials
         )
-        if not success:
-             raise HTTPException(status_code=401, detail="Invalid node ID or credentials")
         return {"status": "ok"}
-    except AttributeError:
-        raise HTTPException(status_code=501, detail="Reconnection not supported by registry")
-    except HTTPException:
-        raise
-    except Exception as e:
-        if isinstance(e, registry.NodeAuthError):
-            raise HTTPException(status_code=401, detail=str(e))
+    except registry.NodeAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except registry.InvalidNodeData as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error during reconnect")
 
 @app.post("/start", response_model=ModelStatusResponse)
@@ -290,6 +288,7 @@ async def stop_model(_admin: str = Depends(get_admin)):
 async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
     verify_admin(_admin)
     
+    # Validation first
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported in MVP")
 
@@ -328,4 +327,6 @@ async def chat(request: ChatRequest, _admin: str = Depends(get_admin)):
         raise HTTPException(status_code=503, detail="Inference server unreachable")
 
 if __name__ == "__main__":
-    uvicorn.run("coordinator.main:app", host="127.0.0.1", port=8000, reload=True)
+    host = os.environ.get("LOWLLAMA_COORDINATOR_HOST", "127.0.0.1")
+    port = int(os.environ.get("LOWLLAMA_COORDINATOR_PORT", 8000))
+    uvicorn.run("coordinator.main:app", host=host, port=port, reload=False)

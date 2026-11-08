@@ -189,7 +189,8 @@ class TestCoordinatorAPI(unittest.TestCase):
 
     @patch("coordinator.registry.reconnect_node", create=True)
     def test_reconnect_fail(self, mock_reconnect):
-        mock_reconnect.return_value = False
+        from coordinator import registry
+        mock_reconnect.side_effect = registry.NodeAuthError("Unauthorized")
         response = self.client.post("/reconnect", json={
             "node_id": "node-123",
             "credentials": "wrong"

@@ -72,6 +72,27 @@ The Master role downloads about 1.2 GB total; the Helper role downloads only
 the approximately 25 MB CPU archive. Helpers need neither Python nor CUDA for
 this milestone. They do not run the Master installation command.
 
+## Deployment: FastAPI Coordinator
+
+The coordinator manages the model lifecycle and worker registry. In a real deployment (e.g., on Itmam's laptop), it must bind to the Tailscale IP.
+
+```powershell
+# Set environment variables for the coordinator
+$env:LOWLLAMA_ADMIN_TOKEN = "your-secret-admin-token"
+$env:LOWLLAMA_MASTER_IP = "100.x.y.z"  # The master's Tailscale IP
+$env:LOWLLAMA_COORDINATOR_HOST = "100.x.y.z"
+$env:LOWLLAMA_COORDINATOR_PORT = "8000"
+
+# Start the coordinator
+.\.venv\Scripts\python.exe coordinator\main.py
+```
+
+For development/localhost:
+```powershell
+.\.venv\Scripts\python.exe coordinator\main.py
+```
+(It defaults to 127.0.0.1:8000 if variables are unset).
+
 ## Master: run the model locally
 
 Use PowerShell in the project root. Installation is already complete on the
