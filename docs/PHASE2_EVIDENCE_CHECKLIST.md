@@ -38,6 +38,12 @@ Check that the RPC0 and RPC1 IPs belong to two different hosts, and that neither
 | Both | `.runtime\logs\evidence\` | `scripts\Collect-Inference-Evidence.ps1` |
 
 PowerShell 5.1 `Tee-Object` writes UTF-16; both scripts read that correctly. All of `.runtime\` is git-ignored.
+
+Log patterns were checked against the format strings inside the pinned b12110 binaries (`llama.dll`, `ggml-rpc.dll`):
+`load_tensors: layer %3d assigned to device %s`, `%s: %12s model buffer size = %8.2f MiB` and
+`using device %s (%s)`. RPC weight buffers may be named `RPCn[host:port]` or `RPC[host:port]`; the parser maps the
+second form to `RPCn` through the `using device RPCn (host:port)` line and marks anything unmapped as FAIL.
+A parse of a **real** master log is still NOT RUN until the first physical master run.
 The API launcher (`/start`) keeps llama-server output only in memory, so **allocation evidence currently needs
 the manual master run**, where the output is saved to `master-remote.log`.
 
@@ -76,9 +82,9 @@ and **both** must show `HELPER COMPUTE PASS`. If one helper runs out of memory o
 | Gate | Check | Result | Evidence (sanitized) |
 |---|---|---|---|
 | P2-A | Shared demo model ID accepted by API and launcher | PASS | `/start` reads `launcher.MODEL_ALLOWLIST` since `e127f2d` (tested) |
-| P2-A | Partial selection refused with reasons | FAIL | `/start` still starts the survivors when at least one worker is usable (expected-failure test) |
-| P2-A | Refusal message names each rejected worker | FAIL | `main.py` calls `.items()` on the `rejected` tuple; the 400 shows a Python error instead (expected-failure test) |
-| P2-A | Unit and integration suites | PASS | see the handoff report for counts |
+| P2-A | Partial selection refused with reasons (all-or-nothing) | PASS | fixed in `4e02045`; ordinary tests, no expected-failure markers |
+| P2-A | Refusal message names each rejected worker, no Python error text | PASS | fixed in `4e02045` (tested) |
+| P2-A | Unit and integration suites | PASS | 2026-11-08 at `4e02045` + Shafin's tests: `discover -s tests` 170 OK, 0 expected failures, 0 skips; `agent/tests` 72 OK |
 | P2-B | Local API/engine start/status/chat/stop (mocked engine) | NOT RUN | |
 | P2-C | Preflight (TCP + list-devices + CUDA0), one helper | NOT RUN | |
 | P2-C | Master model-weight allocation on RPC0 | NOT RUN | |

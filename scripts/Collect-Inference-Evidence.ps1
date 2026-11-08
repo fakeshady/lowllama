@@ -73,6 +73,11 @@ if ($Mode -eq 'Master') {
         if ($line -match ':\s+(\S+)\s+model buffer size\s*=\s*([\d.]+)\s*MiB') {
             $token = $Matches[1]; $mib = [double]$Matches[2]
             $device = Get-BaseDevice $token
+            if ($token -match '^RPC\[([^\]]+)\]') {                  # ggml-rpc may name the buffer RPC[host:port] without an index
+                $bufferEndpoint = $Matches[1]
+                $owner = @($endpoints.Keys | Where-Object { $endpoints[$_] -eq $bufferEndpoint } | Select-Object -First 1)
+                if ($owner.Count) { $device = $owner[0] } else { $device = "RPC?[$bufferEndpoint]" }   # unmapped: shown as FAIL, never guessed
+            }
             $modelMiB[$device] = $mib
             if ($device -like 'RPC*' -and $token -match '\[([^\]]+)\]') { $endpoints[$device] = $Matches[1] }
         }

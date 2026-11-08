@@ -338,6 +338,38 @@ class StartHandoffTests(unittest.TestCase):
         self.assertNotIn("attribute",text)   # no Python error text leaking into the API
         for expected in (not_ready,"rpc_not_ready","node-missing","unknown_node"): self.assertIn(expected,text)
 
+    def test_eligible_offline_and_unknown_together_refuse_everything(self):
+        good=self.ready("Good","100.64.0.2")
+        gone=self.ready("Gone","100.64.0.4")
+        registry._nodes[gone]["last_seen"]-=registry.OFFLINE_AFTER+1
+        status,body=self.start({"model_id":self.model,"node_ids":[good,gone,"node-missing"]})
+        self.assertEqual(status,400,body)
+        self.assertEqual(self.calls,[])   # all-or-nothing: the eligible one is NOT started alone
+        text=json.dumps(body)
+        for expected in (gone,"offline","node-missing","unknown_node"): self.assertIn(expected,text)
+        for leak in ("Traceback","Error selecting","attribute"): self.assertNotIn(leak,text)
+
+    def test_same_node_id_twice_counts_once(self):
+        a=self.ready("A","100.64.0.2")
+        status,body=self.start({"model_id":self.model,"node_ids":[a,a]})
+        self.assertEqual(status,200,body)
+        self.assertEqual(body["worker_ids"],[a])   # never one helper counted as RPC0 and RPC1
+        self.assertEqual(self.calls[0][1].rpc_endpoints(),"100.64.0.2:50052")
+
+    def test_unknown_free_ram_is_allowed_not_assumed(self):
+        a=self.ready("NoRamReport","100.64.0.2",free=None)
+        status,body=self.start({"model_id":self.model,"node_ids":[a]})
+        self.assertEqual(status,200,body)
+        self.assertIsNone(self.calls[0][1].candidates[0].free_ram_gb)   # passed on as unknown, not invented
+
+    def test_two_nodes_on_one_endpoint_are_refused(self):
+        a=self.ready("First","100.64.0.2")
+        b=self.ready("StaleCopy","100.64.0.2")   # same address:port, e.g. a re-enrolled laptop
+        status,body=self.start({"model_id":self.model,"node_ids":[a,b]})
+        self.assertEqual(status,400,body)
+        self.assertEqual(self.calls,[])
+        self.assertIn("duplicate_endpoint",json.dumps(body))
+
 
 @unittest.skipUnless(_has_route("/start"),"this checkout's main.py has no POST /start yet")
 class StartWithRealLauncherTests(unittest.TestCase):
@@ -393,6 +425,34 @@ class StartWithRealLauncherTests(unittest.TestCase):
         self.assertNotEqual(status,200,body)
         popen.assert_not_called()
         self.assertIn("not llama.cpp compatible",self.http.get("/status",ADMIN_HEADER)[1]["error"])
+
+    def test_two_distinct_helpers_become_rpc0_rpc1_in_selected_order(self):
+        import io, subprocess
+        a=registry.register_node("HelperA",16,50052,address="100.64.0.2",free_ram_gb=8.0,rpc_ready=True)["node_id"]
+        b=registry.register_node("HelperB",16,50052,address="100.64.0.3",free_ram_gb=2.0,rpc_ready=True)["node_id"]
+        child=mock.MagicMock(); child.poll.return_value=None; child.stdout=io.StringIO("")
+        def stop_child(): child.poll.return_value=-15
+        child.terminate.side_effect=stop_child
+        def probe(command, **kwargs):   # each endpoint is probed alone, so it always lists as RPC0
+            return subprocess.CompletedProcess(args=command,returncode=0,stdout=f"Available devices:\n  RPC0: {command[2]} (16000 MiB, 8000 MiB free)",stderr="")
+        with (mock.patch.object(self.launcher.socket,"create_connection"),
+              mock.patch.object(self.launcher.subprocess,"run",side_effect=probe) as run,
+              mock.patch.object(self.launcher.subprocess,"Popen",return_value=child) as popen,
+              mock.patch.object(self.launcher,"_health_is_ready",return_value=True)):
+            status,body=self.http.post("/start",{"model_id":self.model,"node_ids":[b,a]},ADMIN_HEADER)   # B first on purpose
+            self.assertEqual(status,200,body)
+            deadline=time.time()+2
+            while self.http.get("/status",ADMIN_HEADER)[1]["status"]!="ready" and time.time()<deadline: time.sleep(0.01)
+            state=self.http.get("/status",ADMIN_HEADER)[1]
+        self.assertEqual((state["status"],state["worker_ids"],state["model_id"]),("ready",[b,a],self.model))
+        self.assertEqual([c.args[0][2] for c in run.call_args_list],["100.64.0.3:50052","100.64.0.2:50052"])   # both probed
+        command=popen.call_args.args[0]
+        self.assertEqual(command[command.index("--rpc")+1],"100.64.0.3:50052,100.64.0.2:50052")   # B = RPC0, A = RPC1
+        self.assertEqual(command[command.index("--device")+1],"CUDA0,RPC0,RPC1")
+        self.assertEqual(command[command.index("--alias")+1],self.model)
+        self.assertEqual(self.http.post("/stop",{},ADMIN_HEADER)[0],200)
+        self.assertEqual(self.http.get("/status",ADMIN_HEADER)[1]["status"],"stopped")
+        child.terminate.assert_called_once()   # only its own child was stopped
 
 
 if __name__=="__main__":
